@@ -1,0 +1,24 @@
+# Ignore everything
+*
+
+# Un-ignore .gitignore itself
+!.gitignore
+
+# Un-ignore the Agents directory
+!Agents/
+
+# Ignore everything inside the Agents directory
+Agents/*
+
+# Un-ignore the MyAgent and SAD2 directories
+!Agents/MyAgent/
+!Agents/SAD2/
+
+# Un-ignore specific files in the root directory
+!空戦AIの戦略とコード_SAD_v1.1.txt
+!作業サマリー.txt
+!新SAD_v1.0.md
+
+# Ignore python cache files
+**/__pycache__/
+**/*.pyc

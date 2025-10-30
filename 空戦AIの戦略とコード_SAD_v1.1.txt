@@ -1,0 +1,351 @@
+﻿承知いたしました。
+現在の最新戦略「積極的迎撃ドクトリン」の概要と、その戦略を実装した全コード、そして各コードの詳細な解説を以下にまとめます。
+________________
+
+
+最終戦略：積極的迎撃ドクトリン (Aggressive Intercept Doctrine)
+
+
+本AIエージェントは、従来の「捜索・打撃」の役割分担をベースに、過去の優勝者の解法 1 を今年のルールに適合させる形で統合した、極めて攻撃的な戦略です。生存性と攻撃性を両立させ、能動的に戦場の主導権を握ることを目指します。
+
+
+1. 役割分担 (継続)
+   * 捜索機 (Searcher) x2 (3, 4号機): 偵察部隊。VIPの前方にフォーメーションを組んで飛行し、脅威度の高い敵機を早期に発見・特定。その情報を打撃機へ伝達します。
+   * 打撃機 (Striker) x2 (1, 2号機): 攻撃専門部隊。捜索機から共有された単一目標に対し、2機で火力を集中させ、迅速かつ確実に撃破します。
+2. 主要戦術
+   * 階層的ミサイル回避: 過去の優勝者の知見に基づき、MWS（ミサイル警報装置）でミサイルを検知してからの経過時間に応じて、回避行動を3段階に最適化します 2。これにより、無駄な回避時間を徹底的に排除し、攻撃の機会を最大化します。
+
+   * 10秒以内 (OUT): 最大脅威。ミサイルの飛来方向から真逆に離脱し、確実に回避します。
+   * 10秒～20秒 (BEAM): 脅威は減衰。ミサイルに対し直角に飛行し、エネルギー損失を抑えつつ攻撃態勢へ復帰しやすくします。
+   * 20秒以上 (IGNORE): 脅威はほぼ消滅。回避を中止し、即座に任務へ復帰します。
+   * 敵弾数カウントと全力攻撃モード: 敵が発射したミサイルをMWSのtruth情報で個体識別し、総数をカウントします 3。敵がミサイルを全弾（8発）撃ち尽くしたと判断した場合、防御を捨てて目標に直進する**「全力攻撃モード」**へ移行し、残敵を掃討します。
+
+   * 高度優位の維持と積極的な前線構築: 短距離戦闘での機動性を重視しつつも、常に敵のわずかに上方（約5°）を飛行することで、エネルギー的な優位を確保します 4。また、捜索機はVIPの前方20kmまで進出し、積極的に戦線を押し上げます。
+
+   * 柔軟な目標選定: 打撃機は共有ターゲットを最優先としますが、それがいない場合は即座に「最も近い敵」へ目標を切り替えることで、攻撃のテンポを一切緩めません。
+________________
+
+
+完成コードと解説
+
+
+この新戦略を実装した最終版のコードです。5つのファイルで構成されています。
+
+
+1. __init__.py (メインファイル)
+
+
+解説:
+エージェント全体を統括する司令塔です。新たに**enemy_missile_truths**というセット変数を導入し、敵が発射した全ミサイルのユニークIDを記録します。このセットのサイズ（＝敵のミサイル発射数）を各モジュールに渡すことで、高度な戦術判断（全力攻撃モードなど）を可能にしています。
+
+
+Python
+
+
+
+
+# Agents/MyAgent/__init__.py
+import numpy as np
+from . import targeting
+from . import maneuver
+from . import evasion
+
+class MyAgent():
+   def __init__(self, name, number):
+       self.name = name
+       self.number = number
+       self.role = "Striker" if self.number <= 2 else "Searcher"
+       self.friend_name = name
+       self.enemy_name = "Red" if self.name == "Blue" else "Blue"
+       self.last_shoot_time = -100
+       self.detected_missiles = {}
+       # ★【新機能】敵が発射したミサイルのユニークIDを記録するセット
+       self.enemy_missile_truths = set()
+       self.shared_target_id = None
+       self.alert_state = {"direction": 1, "last_switch_time": 0}
+
+   def commands(self, obs, conf):
+       actions = {}
+       my_unit = obs["teams"][self.friend_name]["units"][self.number - 1]
+
+       if self.number == 5:
+           return {}
+
+       # 1. ミサイル回避 (最優先)
+       evasion_command, self.detected_missiles, self.enemy_missile_truths = evasion.get_evasion_maneuver(
+           my_unit, obs, self.detected_missiles, self.enemy_missile_truths
+       )
+       if evasion_command:
+           actions["motion"] = evasion_command
+           return actions
+
+       # ★ 敵のミサイル発射数をカウント
+       enemy_missile_count = len(self.enemy_missile_truths)
+
+       # 2. ターゲットの選定
+       target_info, self.shared_target_id = targeting.select_target(
+           my_unit, self.role, obs, conf, self.enemy_name, self.shared_target_id
+       )
+
+       # 3. 機動と射撃の判断
+       if target_info:
+           motion_command, shoot_command = maneuver.combat_maneuver(
+               my_unit,
+               target_info,
+               obs,
+               self.last_shoot_time,
+               enemy_missile_count # ★ 敵の弾数を渡す
+           )
+           if shoot_command:
+               actions["weapon"] = shoot_command
+               self.last_shoot_time = obs["time"]
+       else:
+           motion_command, self.alert_state = maneuver.alert_maneuver(
+               my_unit, self.role, obs, self.alert_state, self.number
+           )
+
+       actions["motion"] = motion_command
+       return actions
+
+def getUserAgentClass(name, number):
+   """必須の関数: この関数でエージェントクラスを返す"""
+   return MyAgent(name, number)
+
+________________
+
+
+2. targeting.py (目標選定モジュール)
+
+
+解説:
+打撃機（Striker）のロジックを改良。捜索機からの共有ターゲットがいない場合、ただ待機するのではなく、過去の優勝者の解法に倣い「自機から最も近い敵」を代替目標とすることで、攻撃の機会損失を防ぎ、常に能動的に行動し続けます。
+
+
+Python
+
+
+
+
+# Agents/MyAgent/targeting.py
+import numpy as np
+from . import utils
+
+def calculate_threat(enemy_unit, vip_unit):
+   # (変更なし)
+   if not enemy_unit or not vip_unit or not enemy_unit["alive"] or not vip_unit["alive"]:
+       return 0.0
+   vip_pos = np.array(vip_unit["pos"])
+   enemy_pos = np.array(enemy_unit["pos"])
+   enemy_vel = np.array(enemy_unit["vel"])
+   to_vip_vec = vip_pos - enemy_pos
+   distance_to_vip = np.linalg.norm(to_vip_vec)
+   closing_speed = np.dot(enemy_vel, utils.normalize(to_vip_vec))
+   threat_score = (1 / (distance_to_vip + 1e-6)) * max(0, closing_speed)
+   return threat_score
+
+def select_target(my_unit, role, obs, conf, enemy_name, shared_target_id):
+   my_pos = np.array(my_unit["pos"])
+   enemy_units = obs["teams"][enemy_name]["units"]
+   my_vip = obs["teams"][my_unit["team"]]["units"][4]
+   alive_enemy_fighters = [u for u in enemy_units if u["type"] == "fighter" and u["alive"]]
+   new_shared_target_id = shared_target_id
+
+   if role == "Searcher":
+       if not my_vip["alive"] or not alive_enemy_fighters:
+           return None, None
+       for enemy in alive_enemy_fighters:
+           enemy["threat"] = calculate_threat(enemy, my_vip)
+       most_dangerous_enemy = max(alive_enemy_fighters, key=lambda u: u.get("threat", 0))
+       if most_dangerous_enemy.get("threat", 0) > 0:
+           new_shared_target_id = most_dangerous_enemy["id"]
+           return most_dangerous_enemy, new_shared_target_id
+       else:
+           return None, None
+
+   elif role == "Striker":
+       target_unit = None
+       if shared_target_id is not None:
+           target_unit = next((u for u in alive_enemy_fighters if u["id"] == shared_target_id), None)
+
+       # ★【改良】共有ターゲットがいない場合、最も近い敵を狙う
+       if target_unit is None and alive_enemy_fighters:
+           target_unit = min(alive_enemy_fighters, key=lambda u: utils.get_distance(my_pos, u["pos"]))
+           new_shared_target_id = target_unit["id"] if target_unit else None
+
+       return target_unit, new_shared_target_id
+           
+   return None, shared_target_id
+
+________________
+
+
+3. maneuver.py (機動制御モジュール)
+
+
+解説:
+過去の優勝者の戦術を全面的に導入し、最も大きく進化したモジュールです。
+      * combat_maneuver:
+      * 敵のミサイル発射数が8発以上の場合、防御を完全に捨てて目標に直進する**「全力攻撃モード」**を実装しました。
+      * 通常時においても、常にターゲットの5度上方を目指して飛行し、高度優位性を確保します（上限8000m）5。
+
+         * alert_maneuver: 捜索機のフォーメーション基準点をVIPの前方20kmまで押し上げることで、より積極的に前線を構築し、敵にプレッシャーをかけます 6。
+
+
+
+Python
+
+
+
+
+# Agents/MyAgent/maneuver.py
+import numpy as np
+from . import utils
+
+def combat_maneuver(my_unit, target_unit, obs, last_shoot_time, enemy_missile_count):
+   """【新戦術】敵弾数と高度優位を考慮した戦闘機動"""
+   my_pos, my_vel = np.array(my_unit["pos"]), np.array(my_unit["vel"])
+   target_pos = np.array(target_unit["pos"])
+   distance = utils.get_distance(my_pos, target_pos)
+   shoot_command = None
+
+   # ★【新機能】敵が8発撃ち尽くしたら、回避せず直進する
+   if enemy_missile_count >= 8:
+       motion_command = {"type": "fly", "target": target_pos, "speed": "max"}
+       if distance < 20000 and my_unit["missile"] > 0:
+            shoot_command = {"type": "shoot", "target": target_unit["id"]}
+       return motion_command, shoot_command
+
+   is_shootable = distance < 20000
+   if is_shootable:
+       if obs["time"] - last_shoot_time > 3.0 and my_unit["missile"] > 0:
+           shoot_command = {"type": "shoot", "target": target_unit["id"]}
+       to_enemy_vec = target_pos - my_pos
+       crank_direction = np.cross(to_enemy_vec, my_vel)
+       crank_target = my_pos + utils.normalize(crank_direction) * 20000
+       motion_command = {"type": "fly", "target": crank_target, "speed": "max"}
+   else:
+       # ★【新機能】高度優位を確保するため、常に少し上を狙う
+       direction_to_target = utils.normalize(target_pos - my_pos)
+       up_vector = np.array([0, 0, 1])
+       # 敵方向ベクトルと上方向ベクトルを合成して、5度上を狙う
+       fly_direction = utils.normalize(direction_to_target + np.tan(np.deg2rad(5)) * up_vector)
+       target_fly_pos = my_pos + fly_direction * distance
+       # 高度上限を8000mに設定
+       target_fly_pos[2] = min(target_fly_pos[2], 8000.0)
+       motion_command = {"type": "fly", "target": target_fly_pos, "speed": "max"}
+       
+   return motion_command, shoot_command
+
+def alert_maneuver(my_unit, role, obs, alert_state, number):
+   my_pos = np.array(my_unit["pos"])
+   my_vip = obs["teams"][my_unit["team"]]["units"][4]
+   if not my_vip["alive"]:
+       target_pos = np.array([0, 0, my_pos[2]])
+       motion_command = {"type": "fly", "target": target_pos, "speed": "max"}
+       return motion_command, alert_state
+   vip_pos = np.array(my_vip["pos"])
+   vip_vel_norm = utils.normalize(my_vip["vel"]) if np.linalg.norm(my_vip["vel"]) > 0 else np.array([1, 0, 0])
+
+   if role == "Searcher":
+       # ★前線維持のため、VIPの前方20kmを基準点とする
+       base_pos = vip_pos + vip_vel_norm * 20000
+       side_vec = utils.normalize(np.cross(vip_vel_norm, [0, 0, 1]))
+       wing_direction = -1 if number == 3 else 1
+       formation_pos = base_pos + (side_vec * 7000 * wing_direction) # 7km間隔
+       motion_command = {"type": "fly", "target": formation_pos, "speed": "normal"}
+   else: # Striker
+       target_pos = vip_pos - vip_vel_norm * 10000
+       motion_command = {"type": "fly", "target": target_pos, "speed": "normal"}
+
+   return motion_command, alert_state
+
+________________
+
+
+4. evasion.py (ミサイル回避モジュール)
+
+
+解説:
+過去の優勝者の解法の核心である、
+階層的なミサイル回避ロジックを完全に実装しました 7。検知後の経過時間に応じて「OUT」「BEAM」「無視」を使い分けることで、生存性と攻撃機会の最適なバランスを実現します。また、このモジュール内でMWSの
+
+
+truth情報をenemy_missile_truthsセットに追加し、敵の弾数カウントを行います。
+
+
+Python
+
+
+
+
+# Agents/MyAgent/evasion.py
+import numpy as np
+from . import utils
+
+def get_evasion_maneuver(my_unit, obs, detected_missiles, enemy_missile_truths):
+   """【新戦術】経過時間に応じた階層的ミサイル回避"""
+   if "mws" not in my_unit or not my_unit["mws"]:
+       return None, detected_missiles, enemy_missile_truths
+
+   # 全てのMWSコンタクトを記録
+   for mws_info in my_unit["mws"]:
+       truth = mws_info["truth"]
+       # 新しいミサイルを検知したら記録
+       if truth not in detected_missiles:
+           detected_missiles[truth] = obs["time"]
+       # 敵全体のミサイルとして記録
+       enemy_missile_truths.add(truth)
+
+   # 最新（＝最も危険）のミサイルを特定
+   most_dangerous_missile = max(my_unit["mws"], key=lambda m: m["time"])
+   time_since_detection = obs["time"] - detected_missiles[most_dangerous_missile["truth"]]
+   
+   direction = np.array(most_dangerous_missile["direction"])
+   my_pos, my_vel = np.array(my_unit["pos"]), np.array(my_unit["vel"])
+   
+   # ★ 解法ドキュメントに基づく3段階の回避ロジック
+   if time_since_detection <= 10.0:
+       # 10秒以内: OUT機動 (ミサイルから最大角で離れる)
+       evade_target = my_pos - direction * 20000
+       return {"type": "fly", "target": evade_target, "speed": "max"}, detected_missiles, enemy_missile_truths
+   elif time_since_detection <= 20.0:
+       # 10～20秒: BEAM機動 (ミサイルに対し直角に飛行)
+       beam_vec = np.cross(direction, my_vel)
+       beam_target = my_pos + utils.normalize(beam_vec) * 20000
+       return {"type": "fly", "target": beam_target, "speed": "max"}, detected_missiles, enemy_missile_truths
+   else:
+       # 20秒以上: 脅威なしと判断し、回避を終了
+       return None, detected_missiles, enemy_missile_truths
+
+________________
+
+
+5. utils.py (ユーティリティモジュール)
+
+
+解説:
+このモジュールに変更はありません。引き続き、距離計算、ベクトルの正規化、角度計算など、複数のモジュールで共通して使用される数学的なヘルパー関数を提供し、コードの可読性と再利用性を高めています。
+
+
+Python
+
+
+
+
+# Agents/MyAgent/utils.py
+import numpy as np
+
+def get_distance(pos1, pos2):
+   """2点間の3D距離を計算"""
+   return np.linalg.norm(np.array(pos1) - np.array(pos2))
+
+def normalize(vector):
+   """ベクトルを正規化する"""
+   norm = np.linalg.norm(vector)
+   return vector / norm if norm > 0 else vector
+
+def get_angle(vec1, vec2):
+   """2つのベクトル間の角度を度数法で計算"""
+   vec1_u = normalize(vec1)
+   vec2_u = normalize(vec2)
+   return np.degrees(np.arccos(np.clip(np.dot(vec1_u, vec2_u), -1.0, 1.0)))
