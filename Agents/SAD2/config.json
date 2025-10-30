@@ -1,0 +1,25 @@
+{
+  "original": {
+    "interval": {"unit": "time", "step": 1.0, "perceive": 1.0, "control": 1.0, "behave": 1.0},
+    "altMin": 7000.0,
+    "altMax": 13000.0,
+    "nominalAlt": 10000.0,
+    "minimumV": 200.0,
+    "recoveryV": 240.0,
+    "crankAz": 0.610865,          
+    "beamAz": 1.570796,           
+    "pitbullDelay": 6.0,
+    "dragTime": 6.0,
+    "recommitTime": 6.0,
+    "maxSimulShot": 2,
+    "rShotThreshold": 0.85,
+    "shotIntervalMin": 6.0,
+    "w_invTTI": 1.2,
+    "w_closure": 0.5,
+    "w_aspect": 0.2,
+    "pkThreshold": 0.5,
+    "pk_w_r": 0.6,
+    "pk_w_closure": 0.3,
+    "pk_w_aspect": 0.1
+  }
+}
