@@ -21,7 +21,7 @@ from BasicAgentUtility.util import (
 )
 
 
-class SAD2Agent(Agent):
+class SADAgent(Agent):
     class ActionInfo:
         def __init__(self):
             self.dstDir = np.array([1.0, 0.0, 0.0])
@@ -54,6 +54,20 @@ class SAD2Agent(Agent):
         self.maxSimulShot = int(cfg.get("maxSimulShot", 2))
         self.rShotThreshold = float(cfg.get("rShotThreshold", 0.85))
         self.shotIntervalMin = float(cfg.get("shotIntervalMin", 5.0))
+        # New: speed/altitude band and stack parameters
+        self.vBandMin = float(cfg.get("vBandMin", 260.0))
+        self.vBandMax = float(cfg.get("vBandMax", 300.0))
+        self.bandAltMin = float(cfg.get("bandAltMin", 9000.0))
+        self.bandAltMax = float(cfg.get("bandAltMax", 11000.0))
+        self.stackAlt = float(cfg.get("stackAlt", 1800.0))
+        # New: forward gate geometry
+        self.capD = float(cfg.get("capD", 15000.0))
+        self.capL = float(cfg.get("capL", 7000.0))
+        # New: intercept horizon limits
+        self.tauMin = float(cfg.get("tauMin", 2.0))
+        self.tauMax = float(cfg.get("tauMax", 8.0))
+        # New: bias weight for centrality
+        self.centerBiasW = float(cfg.get("centerBiasW", 0.15))
         # Boundary limiter defaults (overridden by ruler values where applicable)
         self.dOutLimit = float(cfg.get("dOutLimit", 7500.0))
         self.dOutLimitThreshold = float(cfg.get("dOutLimitThreshold", 15000.0))
@@ -79,7 +93,7 @@ class SAD2Agent(Agent):
         self.actionInfos = {}
         self.last_action_obs = {}
         for _, parent in self.parents.items():
-            self.actionInfos[parent.getFullName()] = SAD2Agent.ActionInfo()
+            self.actionInfos[parent.getFullName()] = SADAgent.ActionInfo()
             self.last_action_obs[parent.getFullName()] = np.zeros([6], dtype=np.float32)
 
         # Team origin (set properly in validate())
@@ -202,18 +216,25 @@ class SAD2Agent(Agent):
     # --- tactical helpers ---
 
     def compute_threat(self, myMotion: MotionState, t: Track3D) -> float:
-        # invTTI toward our defense line in team coords + closing + aspect
+        # Boundary非依存寄りの指標へ調整：距離(近いほど高)、閉塞速度(+)、前方占位(+)、invTTIは弱め
         dr = t.pos() - myMotion.pos()
+        d2 = float(np.linalg.norm(dr[:2])) + 1e-6
         rel_v = t.vel() - myMotion.vel()
-        closing = -float(np.dot(dr[:2], rel_v[:2])) / (float(np.linalg.norm(dr[:2])) + 1e-6)
-        epos = self.teamOrigin.relPtoB(t.pos())
+        closing = max(0.0, -float(np.dot(dr[:2], rel_v[:2])) / d2)
+        # 前方占位: 敵速度が自陣方向へ向いている度合い（チーム座標の-x方向を自陣内向きとみなす）
         evel = self.teamOrigin.relPtoB(t.vel())
-        xdist = max(0.0, abs(float(epos[0])))
-        e_vx = float(evel[0])
-        inv_tti = max(0.0, -e_vx) / (xdist + 1e3)
-        los = dr / (np.linalg.norm(dr) + 1e-6)
-        aspect = abs(float(los[1]))
-        return self.w_invTTI * inv_tti + self.w_closure * closing + self.w_aspect * aspect
+        front = max(0.0, -float(evel[0]))  # >0 でこちら向き
+        # 距離スコアは 1/(d + const) で近距離優先
+        w_dist = 1.0
+        w_front = 0.8
+        w_close = self.w_closure
+        w_itti = 0.2 * self.w_invTTI  # 影響を弱める
+        dist_score = 1.0 / (d2 + 5000.0)
+        # invTTI（弱）
+        epos = self.teamOrigin.relPtoB(t.pos())
+        xdist = max(0.0, abs(float(epos[0]))) + 1e3
+        inv_tti = front / xdist
+        return w_dist * dist_score + w_front * front / 300.0 + w_close * np.tanh(closing / 200.0) + w_itti * inv_tti
 
     def select_targets(self):
         # attackers: threat-based distinct; defenders: max threat
@@ -278,6 +299,55 @@ class SAD2Agent(Agent):
         az = atan2(base_dir[1], base_dir[0]) + side * self.crankAz
         return np.array([cos(az), sin(az), 0.0])
 
+    # --- new geometric helpers ---
+    def _normalize2d(self, v):
+        n = float(np.linalg.norm(v[:2]))
+        if n < 1e-6:
+            return np.array([1.0, 0.0, 0.0])
+        return np.array([v[0] / n, v[1] / n, 0.0])
+
+    def blend_dir(self, a, b, w_b):
+        w_a = 1.0 - w_b
+        v = w_a * a + w_b * b
+        n = float(np.linalg.norm(v[:2]))
+        if n < 1e-6:
+            return np.array([1.0, 0.0, 0.0])
+        return np.array([v[0] / n, v[1] / n, v[2] if abs(v[2]) > 1e-6 else 0.0])
+
+    def compute_intercept_dir(self, myMotion: MotionState, tgt: Track3D):
+        # 2Dリード迎撃: tau ~ |dr|/closing_speed を [tauMin..tauMax] にクリップ
+        myp = myMotion.pos(); myv = myMotion.vel()
+        tp = tgt.pos(); tv = tgt.vel()
+        dr = tp - myp
+        rel = tv - myv
+        closing = max(1.0, -float(np.dot(dr[:2], rel[:2])) / (float(np.linalg.norm(dr[:2])) + 1e-6))
+        tau = float(np.clip(float(np.linalg.norm(dr[:2])) / closing, self.tauMin, self.tauMax))
+        aim = tp + tv * tau
+        dirv = aim - myp
+        dirv[2] = 0.0
+        return self._normalize2d(dirv)
+
+    def soft_center_bias_dir(self, myMotion: MotionState, base_dir):
+        # 中央(Y=0)指向の弱いバイアスを付与（境界押し出しを抑制）
+        pB = self.teamOrigin.relPtoB(myMotion.pos())
+        biasB = np.array([0.0, -float(pB[1]), 0.0])
+        biasP = self.teamOrigin.relBtoP(biasB)
+        bias_dir = self._normalize2d(biasP)
+        return self.blend_dir(base_dir, bias_dir, float(self.centerBiasW))
+
+    def compute_beam_dir(self, current_dir, threat_dir):
+        # 脅威LOSに対して±90度のビーム。回頭量の小さい側を選択
+        th = self._normalize2d(threat_dir)
+        # 2D 90度回転（左/右）
+        left = np.array([-th[1], th[0], 0.0])
+        right = np.array([th[1], -th[0], 0.0])
+        cur = self._normalize2d(current_dir)
+        # コサイン距離が小さい方（=向きが近い方）を選ぶ
+        if float(np.dot(cur[:2], left[:2])) >= float(np.dot(cur[:2], right[:2])):
+            return left
+        else:
+            return right
+
     def deploy(self, action):
         # refresh observables
         self.extractFriendObservables()
@@ -286,6 +356,17 @@ class SAD2Agent(Agent):
         self.extractEnemyMissileObservables()
 
         targets = self.select_targets()
+
+        # VIP候補（守備ゲートの中心を決める参照）: 先頭機の評価で最大のトラック
+        vip = None
+        if self.lastTrackInfo and len(self.ourMotion) > 0:
+            my0 = self.ourMotion[0]
+            smax, vmax = -1e18, None
+            for t in self.lastTrackInfo:
+                s = self.compute_threat(my0, t)
+                if s > smax:
+                    smax, vmax = s, t
+            vip = vmax
 
         # determine base forward direction in team coords
         fwd = self.teamOrigin.relBtoP(np.array([1.0, 0.0, 0.0]))
@@ -312,25 +393,64 @@ class SAD2Agent(Agent):
             dt = float(now - ai.stateEnterT)
 
             if ai.state == "HIGH_ATTACK":
-                # attackers (first two ports) offset heading (bracket)
+                # attackers: 予測迎撃ベクトルを基準に±crankのブラケット
                 if i < 2:
-                    dirH = np.array([cos(base_az), sin(base_az), 0.0])
-                    ai.dstDir = self.heading_for_bracket(i, dirH)
+                    if tgt and not tgt.is_none():
+                        idir = self.compute_intercept_dir(myMotion, tgt)
+                    else:
+                        idir = np.array([cos(base_az), sin(base_az), 0.0])
+                    bdir = self.heading_for_bracket(i, idir)
+                    ai.dstDir = self.blend_dir(bdir, idir, 0.4)
+                    # 縦スタック: 攻撃ペアで±stackAltを目標とする
+                    try:
+                        curAlt = float(myMotion.pos()[2])
+                    except Exception:
+                        curAlt = self.nominalAlt
+                    sign = -1.0 if (i % 2 == 0) else 1.0
+                    tgtAlt = self.nominalAlt + sign * self.stackAlt
+                    # バンドと併用: 目標を帯域内にクリップ
+                    tgtAlt = max(self.bandAltMin, min(self.bandAltMax, tgtAlt))
+                    dz = tgtAlt - curAlt
+                    if dz > 300.0:
+                        ai.dstDir = np.array([ai.dstDir[0], ai.dstDir[1], 0.12])
+                    elif dz < -300.0:
+                        ai.dstDir = np.array([ai.dstDir[0], ai.dstDir[1], -0.12])
+                    else:
+                        ai.dstDir = np.array([ai.dstDir[0], ai.dstDir[1], 0.0])
                 else:
-                    # defenders: CAP box with Grinder (Hot/Cold)
-                    tmod = (float(self.manager.getElapsedTime()) % (2.0 * self.grinderT))
-                    hot_phase = (tmod < self.grinderT)
-                    is_first_def = (i == 2)
-                    role_hot = (hot_phase and is_first_def) or ((not hot_phase) and (not is_first_def))
-                    front_x = +12000.0
-                    back_x = -12000.0
-                    lat = (-8000.0 if is_first_def else +8000.0)
-                    bx = front_x if role_hot else back_x
-                    cap_point = self.teamOrigin.relBtoP(np.array([bx, lat, 0.0]))
-                    dr = cap_point - myMotion.pos()
-                    dr[2] = 0.0
-                    if np.linalg.norm(dr[:2]) > 1.0:
-                        ai.dstDir = dr / np.linalg.norm(dr)
+                    # defenders: VIPの進行方向前方に可動ゲート（±Lの法線オフセット）
+                    D = float(self.capD)
+                    L = float(self.capL)
+                    if vip is not None and not vip.is_none():
+                        v = vip.vel()
+                        sp = float(np.linalg.norm(v[:2]))
+                        if sp < 30.0:
+                            vel_hat = np.array([cos(base_az), sin(base_az), 0.0])
+                        else:
+                            vel_hat = self._normalize2d(v)
+                        center = vip.pos() + vel_hat * D
+                        n_hat = np.array([-vel_hat[1], vel_hat[0], 0.0])
+                        sign = -1.0 if (i == 2) else 1.0
+                        gate_pt = center + sign * L * n_hat
+                        dr = gate_pt - myMotion.pos(); dr[2] = 0.0
+                        if np.linalg.norm(dr[:2]) > 1.0:
+                            ai.dstDir = dr / np.linalg.norm(dr)
+                        else:
+                            ai.dstDir = vel_hat
+                        # 守備ペアの縦スタック
+                        try:
+                            curAlt = float(myMotion.pos()[2])
+                        except Exception:
+                            curAlt = self.nominalAlt
+                        tgtAlt = self.nominalAlt + (sign * self.stackAlt)
+                        tgtAlt = max(self.bandAltMin, min(self.bandAltMax, tgtAlt))
+                        dz = tgtAlt - curAlt
+                        if dz > 300.0:
+                            ai.dstDir = np.array([ai.dstDir[0], ai.dstDir[1], 0.1])
+                        elif dz < -300.0:
+                            ai.dstDir = np.array([ai.dstDir[0], ai.dstDir[1], -0.1])
+                        else:
+                            ai.dstDir = np.array([ai.dstDir[0], ai.dstDir[1], 0.0])
                     else:
                         ai.dstDir = np.array([cos(base_az), sin(base_az), 0.0])
                 # fire if inside normalized R threshold
@@ -344,8 +464,16 @@ class SAD2Agent(Agent):
                     ok_interval = True
                     if tgt.truth in ai.lastShotTimes:
                         ok_interval = float(now - ai.lastShotTimes[tgt.truth]) >= self.shotIntervalMin
+                    # パートナーの事前クランク中は発射抑制（簡易ローテ同期）
+                    ok_partner = True
+                    if i < 2 and len(sorted_ports) >= 2:
+                        partner_port = sorted_ports[1 - i]
+                        partner_pf = self.parents[partner_port].getFullName()
+                        pai = self.actionInfos.get(partner_pf)
+                        if pai is not None and pai.state == "PRE_PITBULL_CRANK":
+                            ok_partner = False
                     pk = self.compute_pk(parent, myMotion, tgt)
-                    if r < self.rShotThreshold and pk >= self.pkThreshold and parent.isLaunchableAt(tgt) and flying < self.maxSimulShot and ok_interval:
+                    if r < self.rShotThreshold and pk >= self.pkThreshold and parent.isLaunchableAt(tgt) and flying < self.maxSimulShot and ok_interval and ok_partner:
                         ai.launchFlag = True
                         ai.target = tgt
                         ai.lastShotTimes[tgt.truth] = now
@@ -401,6 +529,9 @@ class SAD2Agent(Agent):
                     ai.state = "HIGH_ATTACK"
                     ai.stateEnterT = now
 
+            # 中央指向バイアスを軽く適用
+            ai.dstDir = self.soft_center_bias_dir(myMotion, ai.dstDir)
+
             # Boundary/altitude limiting
             avoider = StaticCollisionAvoider2D()
             c = {
@@ -422,21 +553,20 @@ class SAD2Agent(Agent):
             c = c.copy(); c["p1"], c["p2"] = np.array([-5 * self.dOut, -self.dLine, 0]), np.array([+5 * self.dOut, -self.dLine, 0])
             avoider.borders.append(LinearSegment(c))
             ai.dstDir = avoider(myMotion, ai.dstDir)
-            # MWS-based evasion: if any missile detected, drag away with slight descent
+
+            # MWS回避（統合）：LOSに対して90度のビーム＋軽い降下、速度維持
             myMWS = self.mws[my_idx] if my_idx < len(self.mws) else []
             if len(myMWS) > 0:
-                dr_ev = np.zeros(3)
+                th = np.zeros(3)
                 for m in myMWS:
                     try:
                         d = m.dir()
                     except Exception:
                         d = np.array([1.0, 0.0, 0.0])
-                    dr_ev += d
-                if np.linalg.norm(dr_ev[:2]) > 1e-3:
-                    dr_ev /= np.linalg.norm(dr_ev)
-                    ev_az = atan2(-dr_ev[1], -dr_ev[0])
-                    ai.dstDir = np.array([cos(ev_az), sin(ev_az), -0.2])
-            # (deduplicated) single MWS evasion block retained above
+                    th += d
+                if np.linalg.norm(th[:2]) > 1e-3:
+                    beam2d = self.compute_beam_dir(ai.dstDir, th)
+                    ai.dstDir = np.array([beam2d[0], beam2d[1], -0.12])
 
             # Altitude clamp via AltitudeKeeper while using dstDir
             n = max(1e-6, sqrt(ai.dstDir[0] * ai.dstDir[0] + ai.dstDir[1] * ai.dstDir[1]))
@@ -449,7 +579,7 @@ class SAD2Agent(Agent):
             cs = cos(dstPitch); sn = sin(dstPitch)
             ai.dstDir = np.array([ai.dstDir[0] / n * cs, ai.dstDir[1] / n * cs, -sn])
 
-            # speed/throttle policy
+            # speed/throttle policy with energy band
             ai.asThrottle = True
             ai.dstThrottle = 1.0
             ai.keepVel = False
@@ -457,6 +587,20 @@ class SAD2Agent(Agent):
                 ai.asThrottle = False
                 ai.keepVel = False
                 ai.dstV = self.recoveryV
+            else:
+                # maintain 260-300 m/s band in general phases
+                if ai.state in ("HIGH_ATTACK",) or (ai.state in ("PRE_PITBULL_CRANK",) and i >= 2):
+                    if V > self.vBandMax:
+                        ai.asThrottle = False
+                        ai.keepVel = False
+                        ai.dstV = float(self.vBandMax)
+                    elif V < self.vBandMin:
+                        ai.asThrottle = True
+                        ai.dstThrottle = 1.0
+                        ai.keepVel = False
+                    else:
+                        ai.asThrottle = True
+                        ai.dstThrottle = 1.0
 
             # sanitize and finalize commands for this parent
             # convert dstDir to parent coordinates
