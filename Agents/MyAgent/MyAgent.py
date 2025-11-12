@@ -34,8 +34,10 @@ class SADAgent(Agent):
             self.target = Track3D()
             self.lastShotTimes = {}
             # FSM state control
-            self.state = "HIGH_ATTACK"
+            self.state = "OPENING_SPREAD"
             self.stateEnterT = Time(0.0, TimeSystem.TT)
+            # jink timer for defensive break
+            self.lastJinkFlipT = Time(0.0, TimeSystem.TT)
 
     def initialize(self):
         super().initialize()
@@ -54,6 +56,18 @@ class SADAgent(Agent):
         self.maxSimulShot = int(cfg.get("maxSimulShot", 2))
         self.rShotThreshold = float(cfg.get("rShotThreshold", 0.85))
         self.shotIntervalMin = float(cfg.get("shotIntervalMin", 5.0))
+        # Defensive break/jink tuning
+        self.breakRThreat = float(cfg.get("breakRThreat", 7000.0))
+        self.breakExitR = float(cfg.get("breakExitR", 9000.0))
+        self.breakCosTail = float(cfg.get("breakCosTail", -0.5))  # bandit roughly behind us
+        self.breakEnemyNose = float(cfg.get("breakEnemyNose", 0.6))  # bandit nose toward us
+        self.jinkPeriod = float(cfg.get("jinkPeriod", 2.5))
+        self.jinkVz = float(cfg.get("jinkVz", 0.18))
+        # Pump/extend when outnumbered or geometry is poor
+        self.pumpRThreat = float(cfg.get("pumpRThreat", 15000.0))
+        self.pumpExitR = float(cfg.get("pumpExitR", 18000.0))
+        self.pumpTime = float(cfg.get("pumpTime", 12.0))
+        self.pumpVz = float(cfg.get("pumpVz", 0.1))
         # Boundary limiter defaults (overridden by ruler values where applicable)
         self.dOutLimit = float(cfg.get("dOutLimit", 7500.0))
         self.dOutLimitThreshold = float(cfg.get("dOutLimitThreshold", 15000.0))
@@ -67,6 +81,22 @@ class SADAgent(Agent):
         self.pk_w_closure = float(cfg.get("pk_w_closure", 0.3))
         self.pk_w_aspect = float(cfg.get("pk_w_aspect", 0.1))
         self.grinderT = float(cfg.get("grinderT", 12.0))
+        # Threat analysis weights
+        self.threat_w_self = float(cfg.get("threat_w_self", 0.6))
+        self.threat_w_vip = float(cfg.get("threat_w_vip", 0.4))
+        # Opening spread/volley
+        self.openingSpreadT = float(cfg.get("openingSpreadT", 20.0))
+        self.spreadD = float(cfg.get("spreadD", 20000.0))
+        self.spreadL = float(cfg.get("spreadL", 10000.0))
+        self.spreadAlt = float(cfg.get("spreadAlt", 800.0))
+        self.engageDetectR = float(cfg.get("engageDetectR", 45000.0))
+        self.openingVolleyT = float(cfg.get("openingVolleyT", 40.0))
+        self.openRShotThreshold = float(cfg.get("openRShotThreshold", 0.98))
+        self.openPkBias = float(cfg.get("openPkBias", 0.1))
+        # Datalink/shared targeting
+        self.enableDatalink = bool(cfg.get("enableDatalink", True))
+        self.dlFocusPk = float(cfg.get("dlFocusPk", 0.35))
+        self.dlPrimaryUpdateT = float(cfg.get("dlPrimaryUpdateT", 2.0))
 
         # Runtime containers
         self.ourMotion = []
@@ -87,6 +117,11 @@ class SADAgent(Agent):
         self.dOut = 0.0
         self.dLine = 0.0
         self.altitudeKeeper = AltitudeKeeper()
+        # simple in-agent datalink (blackboard)
+        self.datalink = {
+            "primary_truth": None,
+            "last_update": Time(0.0, TimeSystem.TT),
+        }
 
         # Minimal gym spaces to satisfy GymManager
         self._observation_space = spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32)
@@ -108,7 +143,7 @@ class SADAgent(Agent):
             # Initial heading: forward along team axis
             ai.dstDir = np.array([0.0, -1.0 if self.getTeam() == eastSider else 1.0, 0.0])
             ai.dstAlt = self.nominalAlt
-            ai.state = "HIGH_ATTACK"
+            ai.state = "OPENING_SPREAD"
             ai.stateEnterT = self.manager.getTime()
             ai.lastShotTimes = {}
 
@@ -165,6 +200,26 @@ class SADAgent(Agent):
         ]
         # Sort tracks by proximity to our fighters
         sortTrack3DByDistance(self.lastTrackInfo, self.ourMotion, True)
+        # update datalink primary by global best threat every dlPrimaryUpdateT seconds
+        if self.enableDatalink and len(self.ourMotion) > 0 and len(self.lastTrackInfo) > 0:
+            now = self.manager.getTime()
+            if float(now - self.datalink["last_update"]) >= self.dlPrimaryUpdateT:
+                my0 = self.ourMotion[0]
+                best = None
+                best_s = -1e18
+                for t in self.lastTrackInfo:
+                    try:
+                        s = self.compute_threat(my0, t)
+                        if s > best_s:
+                            best_s, best = s, t
+                    except Exception:
+                        pass
+                if best is not None:
+                    try:
+                        self.datalink["primary_truth"] = best.truth
+                    except Exception:
+                        self.datalink["primary_truth"] = None
+                    self.datalink["last_update"] = now
 
     def extractFriendMissileObservables(self):
         # flatten missiles sorted by launch time
@@ -222,8 +277,30 @@ class SADAgent(Agent):
         inv_tti = front / xdist
         return w_dist * dist_score + w_front * front / 300.0 + w_close * np.tanh(closing / 200.0) + w_itti * inv_tti
 
+    def compute_vip_threat(self, t: Track3D) -> float:
+        """Approximate threat of enemy track to our VIP/cap corridor.
+        Uses team base coordinates as a proxy: enemy nose toward us (front),
+        small x-distance into our side (xdist), and central corridor preference (|y| small).
+        """
+        try:
+            epos = self.teamOrigin.relPtoB(t.pos())
+            evel = self.teamOrigin.relPtoB(t.vel())
+        except Exception:
+            return 0.0
+        xdist = max(0.0, abs(float(epos[0]))) + 1e3
+        ycorr = 1.0 / (5000.0 + abs(float(epos[1])))  # near centerline => higher
+        front = max(0.0, -float(evel[0]))
+        inv_tti = front / xdist
+        # Normalize and combine
+        return 0.7 * inv_tti + 0.3 * ycorr
+
+    def compute_combined_threat(self, myMotion: MotionState, t: Track3D) -> float:
+        s = self.compute_threat(myMotion, t)
+        v = self.compute_vip_threat(t)
+        return float(self.threat_w_self * s + self.threat_w_vip * v)
+
     def select_targets(self):
-        # attackers: threat-based distinct; defenders: max threat
+        # attackers: combined threat (self + VIP corridor) distinct; defenders: VIP-centric threat
         if not self.lastTrackInfo:
             return {}
         targets = {}
@@ -233,7 +310,7 @@ class SADAgent(Agent):
         for i, port in enumerate(sorted_ports[:2]):
             my_idx = list(self.parents.keys()).index(port)
             myMotion = self.ourMotion[my_idx]
-            scores = [(self.compute_threat(myMotion, t), idx, t) for idx, t in enumerate(self.lastTrackInfo)]
+            scores = [(self.compute_combined_threat(myMotion, t), idx, t) for idx, t in enumerate(self.lastTrackInfo)]
             scores.sort(key=lambda x: x[0], reverse=True)
             if scores:
                 if i == 0:
@@ -249,11 +326,10 @@ class SADAgent(Agent):
         for port in sorted_ports[2:4]:
             p = self.parents[port]
             my_idx = list(self.parents.keys()).index(port)
-            myMotion = self.ourMotion[my_idx]
             best = None
             best_score = -1e18
             for t in self.lastTrackInfo:
-                score = self.compute_threat(myMotion, t)
+                score = self.compute_vip_threat(t)
                 if score > best_score:
                     best_score = score
                     best = t
@@ -334,6 +410,40 @@ class SADAgent(Agent):
         else:
             return right
 
+    def detect_close_threat(self, myMotion: MotionState):
+        """Return the most dangerous close threat Track3D and helper metrics.
+        Criteria:
+          - range (2D) < breakRThreat
+          - enemy nose toward us (cos >= breakEnemyNose)
+          - enemy position roughly behind our nose (cosTail <= breakCosTail)
+        """
+        if not self.lastTrackInfo:
+            return None, None, None, None
+        myp = myMotion.pos(); myv = myMotion.vel()
+        vhat = self._normalize2d(myv)
+        best = None; best_r = 1e18; best_cosTail = 1.0; best_cosNose = 0.0
+        for t in self.lastTrackInfo:
+            dr = t.pos() - myp
+            r2 = float(np.linalg.norm(dr[:2]))
+            if r2 <= 1.0:
+                continue
+            # our tail aspect: bandit position relative to our velocity
+            cosTail = float(np.dot(vhat[:2], (dr[:2] / r2)))
+            # bandit nose toward us
+            tv = t.vel(); sp = float(np.linalg.norm(tv[:2]))
+            if sp < 1.0:
+                continue
+            bnhat = tv[:2] / sp
+            toMe = (myp[:2] - t.pos()[:2])
+            toMeN = float(np.linalg.norm(toMe))
+            if toMeN < 1.0:
+                continue
+            cosNose = float(np.dot(bnhat, toMe / toMeN))
+            if r2 < self.breakRThreat and cosTail <= self.breakCosTail and cosNose >= self.breakEnemyNose:
+                if r2 < best_r:
+                    best = t; best_r = r2; best_cosTail = cosTail; best_cosNose = cosNose
+        return best, best_r, best_cosTail, best_cosNose
+
     def deploy(self, action):
         # refresh observables
         self.extractFriendObservables()
@@ -370,15 +480,78 @@ class SADAgent(Agent):
             myMotion = self.ourMotion[my_idx]
             V = np.linalg.norm(myMotion.vel())
 
-            # choose target if available
+            # choose target; allow datalink focus for first two (strikers)
             tgt = targets.get(pf, Track3D())
+            if self.enableDatalink and i < 2 and self.datalink.get("primary_truth") is not None:
+                # try to find matching track by truth
+                for t in self.lastTrackInfo:
+                    try:
+                        if t.truth == self.datalink["primary_truth"]:
+                            tgt = t
+                            break
+                    except Exception:
+                        pass
 
             # FSM transitions (time-based surrogate for pitbull/drag/recommit)
             # Time arithmetic in ASRCAISim1 returns seconds (float)
             now = self.manager.getTime()
             dt = float(now - ai.stateEnterT)
 
+            # High-priority defensive check: close-in threat on our six with nose-on
+            close_tgt, close_r, close_cosTail, close_cosNose = self.detect_close_threat(myMotion)
+            if close_tgt is not None and ai.state != "DEFENSIVE_BREAK_JINK":
+                ai.state = "DEFENSIVE_BREAK_JINK"
+                ai.stateEnterT = now
+                ai.lastJinkFlipT = now
+
+            # Outnumbered quick pump/extend: if 2+ enemies within pumpRThreat, go cold to open range
             if ai.state == "HIGH_ATTACK":
+                nearCnt = 0
+                th_sum = np.zeros(3)
+                for t in (self.lastTrackInfo or []):
+                    dr = t.pos() - myMotion.pos()
+                    dxy = float(np.linalg.norm(dr[:2]))
+                    if dxy < self.pumpRThreat:
+                        nearCnt += 1
+                        th_sum += np.array([dr[0], dr[1], 0.0])
+                if nearCnt >= 2:
+                    ai.state = "PUMP_EXTEND"
+                    ai.stateEnterT = now
+                    # store a quick cold direction opposite to average threat bearing
+                    if np.linalg.norm(th_sum[:2]) > 1.0:
+                        cold = -self._normalize2d(th_sum)
+                    else:
+                        cold = np.array([cos(base_az + np.pi), sin(base_az + np.pi), 0.0])
+                    ai.dstDir = np.array([cold[0], cold[1], self.pumpVz])
+
+            if ai.state == "OPENING_SPREAD":
+                # Early lateral spread and slight altitude stack to avoid bunching and set up bracket
+                # Compute team-forward unit and lateral normal
+                fwd = self.teamOrigin.relBtoP(np.array([1.0, 0.0, 0.0]))
+                fhat = self._normalize2d(fwd)
+                nhat = np.array([-fhat[1], fhat[0], 0.0])
+                # Build a gate point ahead + lateral by index
+                sign = -1.0 if (i % 2 == 0) else 1.0
+                gate_pt = myMotion.pos() + fhat * self.spreadD + sign * self.spreadL * nhat
+                dr = gate_pt - myMotion.pos(); dr[2] = 0.0
+                if np.linalg.norm(dr[:2]) > 1.0:
+                    ai.dstDir = dr / np.linalg.norm(dr)
+                else:
+                    ai.dstDir = fhat
+                # altitude stack
+                alt_off = (i - 1.5) * 0.5 * self.spreadAlt
+                ai.dstAlt = max(self.altMin, min(self.altMax, self.nominalAlt + alt_off))
+                # transition when enemy close or timer expires
+                minR = 1e18
+                for t in (self.lastTrackInfo or []):
+                    d = float(np.linalg.norm((t.pos() - myMotion.pos())[:2]))
+                    if d < minR:
+                        minR = d
+                if dt >= self.openingSpreadT or minR <= self.engageDetectR:
+                    ai.state = "HIGH_ATTACK"
+                    ai.stateEnterT = now
+
+            elif ai.state == "HIGH_ATTACK":
                 # attackers: 予測迎撃ベクトルを基準に±crankのブラケット
                 if i < 2:
                     if tgt and not tgt.is_none():
@@ -420,14 +593,95 @@ class SADAgent(Agent):
                     ok_interval = True
                     if tgt.truth in ai.lastShotTimes:
                         ok_interval = float(now - ai.lastShotTimes[tgt.truth]) >= self.shotIntervalMin
+                    # partner deconfliction: avoid doubling on same tgt unless pk is high
+                    ok_partner = True
+                    for jport, jparent in self.parents.items():
+                        if jport == port:
+                            continue
+                        jai = self.actionInfos[jparent.getFullName()]
+                        if tgt.truth in jai.lastShotTimes:
+                            if float(now - jai.lastShotTimes[tgt.truth]) < self.shotIntervalMin:
+                                ok_partner = False
                     pk = self.compute_pk(parent, myMotion, tgt)
-                    if r < self.rShotThreshold and pk >= self.pkThreshold and parent.isLaunchableAt(tgt) and flying < self.maxSimulShot and ok_interval:
+                    # datalink focus gives slight bias to fire (to maintain pressure)
+                    dl_bias = 0.0
+                    try:
+                        if self.enableDatalink and i < 2 and tgt.truth == self.datalink.get("primary_truth"):
+                            dl_bias = 0.05
+                    except Exception:
+                        pass
+                    # opening volley: be more permissive in first seconds
+                    rThr = self.rShotThreshold
+                    pkBias = dl_bias
+                    # add VIP-threat-based bias to prioritize high-danger bandits
+                    try:
+                        vip_th = self.compute_vip_threat(tgt)
+                        pkBias += min(0.12, 0.08 * vip_th)
+                    except Exception:
+                        pass
+                    if dt <= self.openingVolleyT:
+                        rThr = max(rThr, self.openRShotThreshold)
+                        pkBias += self.openPkBias
+                    if r < rThr and parent.isLaunchableAt(tgt) and flying < self.maxSimulShot and ok_interval and (ok_partner or pk >= max(0.8, self.pkThreshold)) and (pk + pkBias) >= self.pkThreshold:
                         ai.launchFlag = True
                         ai.target = tgt
                         ai.lastShotTimes[tgt.truth] = now
                         ai.state = "PRE_PITBULL_CRANK"
                         ai.stateEnterT = now
                 ai.dstAlt = self.nominalAlt
+
+            elif ai.state == "PUMP_EXTEND":
+                # Turn cold from the group center of threats, extend and slight climb to regain margin
+                th_sum = np.zeros(3)
+                minR = 1e18
+                for t in (self.lastTrackInfo or []):
+                    dr = t.pos() - myMotion.pos()
+                    th_sum += np.array([dr[0], dr[1], 0.0])
+                    minR = min(minR, float(np.linalg.norm(dr[:2])))
+                if np.linalg.norm(th_sum[:2]) > 1.0:
+                    cold = -self._normalize2d(th_sum)
+                else:
+                    cold = np.array([cos(base_az + np.pi), sin(base_az + np.pi), 0.0])
+                ai.dstDir = np.array([cold[0], cold[1], self.pumpVz])
+                ai.dstAlt = min(self.altMax, self.nominalAlt + 800.0)
+                # Exit if distance opened or time elapsed
+                if (minR >= self.pumpExitR) or (dt >= self.pumpTime):
+                    ai.state = "RECLIMB_RECOMMIT"
+                    ai.stateEnterT = now
+
+            elif ai.state == "DEFENSIVE_BREAK_JINK":
+                # Max-performance break with beam and vertical jinks to force overshoot
+                # Threat direction: from us to closest bandit; if lost, fall back to forward beam
+                if close_tgt is not None:
+                    dr = close_tgt.pos() - myMotion.pos()
+                    th2d = np.array([dr[0], dr[1], 0.0])
+                elif tgt and not tgt.is_none():
+                    dr = tgt.pos() - myMotion.pos()
+                    th2d = np.array([dr[0], dr[1], 0.0])
+                else:
+                    th2d = np.array([cos(base_az), sin(base_az), 0.0])
+                beam2d = self.compute_beam_dir(myMotion.vel(), th2d)
+                # Periodic vertical jink
+                if float(now - ai.lastJinkFlipT) >= self.jinkPeriod:
+                    ai.lastJinkFlipT = now
+                phase = 0.0 if float(now - ai.lastJinkFlipT) < self.jinkPeriod / 2.0 else 1.0
+                vz = self.jinkVz if phase < 0.5 else -self.jinkVz
+                ai.dstDir = np.array([beam2d[0], beam2d[1], vz])
+                ai.dstAlt = max(self.altMin, min(self.altMax, self.nominalAlt))
+                # Exit when geometry relaxed or distance opened
+                ok_exit = True
+                if close_tgt is not None:
+                    # recompute metrics
+                    dr = close_tgt.pos() - myMotion.pos()
+                    r2 = float(np.linalg.norm(dr[:2]))
+                    tv = close_tgt.vel(); sp = float(np.linalg.norm(tv[:2]))
+                    cosNose = 0.0
+                    if sp >= 1.0:
+                        cosNose = float(np.dot(tv[:2] / sp, (myMotion.pos()[:2] - close_tgt.pos()[:2]) / max(1.0, float(np.linalg.norm(myMotion.pos()[:2] - close_tgt.pos()[:2])))))
+                    ok_exit = (r2 >= self.breakExitR) or (cosNose < 0.3) or (dt >= 8.0)
+                if ok_exit:
+                    ai.state = "RECLIMB_RECOMMIT"
+                    ai.stateEnterT = now
 
             elif ai.state == "PRE_PITBULL_CRANK":
                 # hold offset crank relative to target bearing
