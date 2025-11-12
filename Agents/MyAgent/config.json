@@ -25,6 +25,8 @@
     "enableDatalink": true,
     "dlFocusPk": 0.35,
     "dlPrimaryUpdateT": 2.0,
+    "initialClimbVz": 0.25,
+    "standoffShotR": 45000.0,
     "openingSpreadT": 20.0,
     "spreadD": 20000.0,
     "spreadL": 10000.0,

@@ -97,6 +97,9 @@ class SADAgent(Agent):
         self.enableDatalink = bool(cfg.get("enableDatalink", True))
         self.dlFocusPk = float(cfg.get("dlFocusPk", 0.35))
         self.dlPrimaryUpdateT = float(cfg.get("dlPrimaryUpdateT", 2.0))
+        # Opening altitude/shot preferences
+        self.initialClimbVz = float(cfg.get("initialClimbVz", 0.25))
+        self.standoffShotR = float(cfg.get("standoffShotR", 45000.0))
 
         # Runtime containers
         self.ourMotion = []
@@ -503,6 +506,12 @@ class SADAgent(Agent):
                 ai.state = "DEFENSIVE_BREAK_JINK"
                 ai.stateEnterT = now
                 ai.lastJinkFlipT = now
+            # Missile warning preemption: if any MWS tracks exist, jink immediately
+            myMWS = self.mws[my_idx] if my_idx < len(self.mws) else []
+            if len(myMWS) > 0 and ai.state != "DEFENSIVE_BREAK_JINK":
+                ai.state = "DEFENSIVE_BREAK_JINK"
+                ai.stateEnterT = now
+                ai.lastJinkFlipT = now
 
             # Outnumbered quick pump/extend: if 2+ enemies within pumpRThreat, go cold to open range
             if ai.state == "HIGH_ATTACK":
@@ -535,9 +544,11 @@ class SADAgent(Agent):
                 gate_pt = myMotion.pos() + fhat * self.spreadD + sign * self.spreadL * nhat
                 dr = gate_pt - myMotion.pos(); dr[2] = 0.0
                 if np.linalg.norm(dr[:2]) > 1.0:
-                    ai.dstDir = dr / np.linalg.norm(dr)
+                    base2d = dr / np.linalg.norm(dr)
                 else:
-                    ai.dstDir = fhat
+                    base2d = fhat
+                # add initial climb component for altitude advantage in the opening
+                ai.dstDir = np.array([base2d[0], base2d[1], self.initialClimbVz])
                 # altitude stack
                 alt_off = (i - 1.5) * 0.5 * self.spreadAlt
                 ai.dstAlt = max(self.altMin, min(self.altMax, self.nominalAlt + alt_off))
@@ -619,6 +630,15 @@ class SADAgent(Agent):
                         pkBias += min(0.12, 0.08 * vip_th)
                     except Exception:
                         pass
+                    # standoff distance rule: if within standoffShotR, bias to shoot immediately
+                    try:
+                        dr2 = tgt.pos() - myMotion.pos()
+                        rng2d = float(np.linalg.norm(dr2[:2]))
+                    except Exception:
+                        rng2d = 1e9
+                    if rng2d <= self.standoffShotR:
+                        rThr = max(rThr, 0.99)
+                        pkBias += 0.12
                     if dt <= self.openingVolleyT:
                         rThr = max(rThr, self.openRShotThreshold)
                         pkBias += self.openPkBias
