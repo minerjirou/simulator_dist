@@ -38,6 +38,9 @@ class SADAgent(Agent):
             self.stateEnterT = Time(0.0, TimeSystem.TT)
             # jink timer for defensive break
             self.lastJinkFlipT = Time(0.0, TimeSystem.TT)
+            # target hysteresis
+            self.currentTruth = None
+            self.currentScore = -1e18
 
     def initialize(self):
         super().initialize()
@@ -84,6 +87,9 @@ class SADAgent(Agent):
         # Threat analysis weights
         self.threat_w_self = float(cfg.get("threat_w_self", 0.6))
         self.threat_w_vip = float(cfg.get("threat_w_vip", 0.4))
+        # Target switching control and VIP priority
+        self.targetSwitchHyst = float(cfg.get("targetSwitchHyst", 0.1))
+        self.vipPickRatio = float(cfg.get("vipPickRatio", 0.85))
         # Opening spread/volley
         self.openingSpreadT = float(cfg.get("openingSpreadT", 20.0))
         self.spreadD = float(cfg.get("spreadD", 20000.0))
@@ -203,16 +209,15 @@ class SADAgent(Agent):
         ]
         # Sort tracks by proximity to our fighters
         sortTrack3DByDistance(self.lastTrackInfo, self.ourMotion, True)
-        # update datalink primary by global best threat every dlPrimaryUpdateT seconds
+        # update datalink primary by global best VIP-centric threat every dlPrimaryUpdateT seconds
         if self.enableDatalink and len(self.ourMotion) > 0 and len(self.lastTrackInfo) > 0:
             now = self.manager.getTime()
             if float(now - self.datalink["last_update"]) >= self.dlPrimaryUpdateT:
-                my0 = self.ourMotion[0]
                 best = None
                 best_s = -1e18
                 for t in self.lastTrackInfo:
                     try:
-                        s = self.compute_threat(my0, t)
+                        s = self.compute_vip_threat(t)
                         if s > best_s:
                             best_s, best = s, t
                     except Exception:
@@ -303,39 +308,84 @@ class SADAgent(Agent):
         return float(self.threat_w_self * s + self.threat_w_vip * v)
 
     def select_targets(self):
-        # attackers: combined threat (self + VIP corridor) distinct; defenders: VIP-centric threat
+        # attackers: prioritize enemy VIP (via VIP-threat) when competitive, else combined threat; defenders: VIP-centric threat
         if not self.lastTrackInfo:
             return {}
         targets = {}
         sorted_ports = sorted(self.parents.keys(), key=lambda k: int(k))
+
+        # precompute global ranking once
+        comb_scores = []
+        vip_scores = []
+        my0 = None
+        for m in self.ourMotion:
+            if np.linalg.norm(m.vel()) > 1e-3:
+                my0 = m
+                break
+        if my0 is None and self.ourMotion:
+            my0 = self.ourMotion[0]
+        for idx, t in enumerate(self.lastTrackInfo):
+            try:
+                comb = self.compute_combined_threat(my0, t) if my0 is not None else 0.0
+            except Exception:
+                comb = 0.0
+            try:
+                vip = self.compute_vip_threat(t)
+            except Exception:
+                vip = 0.0
+            comb_scores.append((comb, idx, t))
+            vip_scores.append((vip, idx, t))
+        comb_scores.sort(key=lambda x: x[0], reverse=True)
+        vip_scores.sort(key=lambda x: x[0], reverse=True)
+
         # attackers
-        attack_scores = []
+        attack_picks = []
         for i, port in enumerate(sorted_ports[:2]):
-            my_idx = list(self.parents.keys()).index(port)
-            myMotion = self.ourMotion[my_idx]
-            scores = [(self.compute_combined_threat(myMotion, t), idx, t) for idx, t in enumerate(self.lastTrackInfo)]
-            scores.sort(key=lambda x: x[0], reverse=True)
-            if scores:
-                if i == 0:
-                    sel = scores[0]
-                    attack_scores = scores
-                else:
-                    sel = scores[0]
-                    if len(scores) > 1 and attack_scores and sel[1] == attack_scores[0][1]:
-                        sel = scores[1]
+            # choose VIP if competitive vs combined best
+            pick = comb_scores[0] if comb_scores else None
+            vip_pick = vip_scores[0] if vip_scores else None
+            if vip_pick and pick and vip_pick[0] >= self.vipPickRatio * pick[0]:
+                cand = vip_pick
+            else:
+                cand = pick
+            # deconflict two attackers by taking next best combined if same index
+            if i == 1 and cand and attack_picks and cand[1] == attack_picks[0][1] and len(comb_scores) > 1:
+                cand = comb_scores[1]
+            if cand:
                 p = self.parents[port]
-                targets[p.getFullName()] = sel[2]
-        # defenders
+                ai = self.actionInfos[p.getFullName()]
+                prev_truth = ai.currentTruth
+                prev_score = ai.currentScore
+                new_truth = getattr(cand[2], 'truth', None)
+                new_score = cand[0]
+                # hysteresis: only switch if significantly better than previous
+                if prev_truth is not None and any(getattr(t, 'truth', None) == prev_truth for _,_,t in comb_scores):
+                    if new_score <= prev_score * (1.0 + self.targetSwitchHyst):
+                        # keep previous target if still in list
+                        kept = False
+                        for s in comb_scores:
+                            if getattr(s[2], 'truth', None) == prev_truth:
+                                targets[p.getFullName()] = s[2]
+                                kept = True
+                                break
+                        if not kept:
+                            targets[p.getFullName()] = cand[2]
+                            ai.currentTruth = new_truth
+                            ai.currentScore = new_score
+                    else:
+                        targets[p.getFullName()] = cand[2]
+                        ai.currentTruth = new_truth
+                        ai.currentScore = new_score
+                else:
+                    targets[p.getFullName()] = cand[2]
+                    ai.currentTruth = new_truth
+                    ai.currentScore = new_score
+                attack_picks.append(cand)
+
+        # defenders: guard VIP by picking max VIP threat
         for port in sorted_ports[2:4]:
             p = self.parents[port]
-            my_idx = list(self.parents.keys()).index(port)
-            best = None
-            best_score = -1e18
-            for t in self.lastTrackInfo:
-                score = self.compute_vip_threat(t)
-                if score > best_score:
-                    best_score = score
-                    best = t
+            best = vip_scores[0][2] if vip_scores else None
             if best is not None:
                 targets[p.getFullName()] = best
         return targets

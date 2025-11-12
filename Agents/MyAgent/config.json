@@ -22,6 +22,8 @@
     "pk_w_aspect": 0.1,
     "threat_w_self": 0.6,
     "threat_w_vip": 0.4,
+    "targetSwitchHyst": 0.1,
+    "vipPickRatio": 0.85,
     "enableDatalink": true,
     "dlFocusPk": 0.35,
     "dlPrimaryUpdateT": 2.0,
