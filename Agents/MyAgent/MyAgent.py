@@ -725,23 +725,42 @@ class SADAgent(Agent):
                     ai.stateEnterT = now
 
             elif ai.state == "DEFENSIVE_BREAK_JINK":
-                # Max-performance break with beam and vertical jinks to force overshoot
-                # Threat direction: from us to closest bandit; if lost, fall back to forward beam
+                # Missile/close threat defence: choose Crank / Beam / Drag by range
+                # Threat direction: from us to closest bandit; if lost, fall back to forward
                 if close_tgt is not None:
                     dr = close_tgt.pos() - myMotion.pos()
-                    th2d = np.array([dr[0], dr[1], 0.0])
                 elif tgt and not tgt.is_none():
                     dr = tgt.pos() - myMotion.pos()
-                    th2d = np.array([dr[0], dr[1], 0.0])
                 else:
-                    th2d = np.array([cos(base_az), sin(base_az), 0.0])
-                beam2d = self.compute_beam_dir(myMotion.vel(), th2d)
-                # Periodic vertical jink
+                    dr = np.array([cos(base_az), sin(base_az), 0.0])
+                th2d = np.array([dr[0], dr[1], 0.0])
+                dxy = float(np.linalg.norm(th2d[:2]))
+                los2d = self._normalize2d(th2d)
+
+                farR = 40000.0
+                midR = 20000.0
+
+                if dxy >= farR:
+                    # Far: crank to hold support while offsetting
+                    base_dir = los2d
+                    crank_dir = self.heading_for_bracket(i, base_dir)
+                    ai.dstDir = self.blend_dir(base_dir, crank_dir, 0.6)
+                elif dxy >= midR:
+                    # Mid: classic beam + gentle descent
+                    beam2d = self.compute_beam_dir(myMotion.vel(), th2d)
+                    ai.dstDir = np.array([beam2d[0], beam2d[1], -abs(self.jinkVz)])
+                else:
+                    # Near: drag (turn tail and extend, slight descent)
+                    drag2d = -los2d
+                    ai.dstDir = np.array([drag2d[0], drag2d[1], -max(0.2, self.jinkVz)])
+
+                # Periodic vertical jink (modulates around chosen horizontal mode)
                 if float(now - ai.lastJinkFlipT) >= self.jinkPeriod:
                     ai.lastJinkFlipT = now
                 phase = 0.0 if float(now - ai.lastJinkFlipT) < self.jinkPeriod / 2.0 else 1.0
-                vz = self.jinkVz if phase < 0.5 else -self.jinkVz
-                ai.dstDir = np.array([beam2d[0], beam2d[1], vz])
+                # Small additional jiggle, keep overall vz downward or small up
+                vz_jink = self.jinkVz if phase < 0.5 else -self.jinkVz
+                ai.dstDir = self.blend_dir(ai.dstDir, np.array([ai.dstDir[0], ai.dstDir[1], vz_jink]), 0.4)
                 ai.dstAlt = max(self.altMin, min(self.altMax, self.nominalAlt))
                 # Exit when geometry relaxed or distance opened
                 ok_exit = True
