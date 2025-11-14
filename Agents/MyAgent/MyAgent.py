@@ -38,6 +38,9 @@ class SADAgent(Agent):
             self.stateEnterT = Time(0.0, TimeSystem.TT)
             # jink timer for defensive break
             self.lastJinkFlipT = Time(0.0, TimeSystem.TT)
+            # target selection hysteresis bookkeeping
+            self.currentTruth = None
+            self.currentScore = -1e18
             # target hysteresis
             self.currentTruth = None
             self.currentScore = -1e18
@@ -87,6 +90,8 @@ class SADAgent(Agent):
         # Threat analysis weights
         self.threat_w_self = float(cfg.get("threat_w_self", 0.6))
         self.threat_w_vip = float(cfg.get("threat_w_vip", 0.4))
+        # Target switching hysteresis (fractional improvement required to retarget)
+        self.targetSwitchHyst = float(cfg.get("targetSwitchHyst", 0.1))
         # Target switching control and VIP priority
         self.targetSwitchHyst = float(cfg.get("targetSwitchHyst", 0.1))
         self.vipPickRatio = float(cfg.get("vipPickRatio", 0.85))
