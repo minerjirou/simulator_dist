@@ -1,24 +1,95 @@
-## 作業サマリー
+## Work Summary (MyAgent Strategy)
 
-### 1. `simulator_dist` プロジェクトの調査
+### 1. Project and Scenario
 
-- ユーザーの指示に基づき、`simulator_dist` ディレクトリの概要と関連資料について調査しました。
-- `README.md`、`docker-compose.yml`、`空戦AIの戦略とコード_SAD_v1.1.txt` などの主要なファイルを読み込み、これがSIGNATEの空戦AIコンペティション用のシミュレータ環境であることを特定しました。
+- Investigated the `simulator_dist` project and confirmed it is the official simulator for the R7 (4th air‑combat AI) competition.
+- Read the core documentation (`README.md`, docs/html/core, `空戦AIの戦略とコード_SAD_v1.1.txt`, etc.) and identified that the scenario is a 4‑fighter escort for one VIP aircraft versus an enemy escort/VIP team in a BVR environment.
 
-### 2. 戦略ドキュメントの徹底分析
+### 2. Overall Concept
 
-- `空戦AIの戦略とコード_SAD_v1.1.txt` に記載されている「積極的迎撃ドクトリン」について詳細な分析を行いました。
-- 主要な戦術（階層的ミサイル回避、全力攻撃モードなど）、各AIの役割分担、コードのモジュール構造を解明し、解説しました。
+- Implement a centralized, rule‑based BVR agent (`Agents/MyAgent`) that:
+  - Builds an energy advantage (high altitude + adequate speed) before committing.
+  - Uses a shared, link‑like picture of enemy tracks based on `/sensor/track` and `/shared/fighter`.
+  - Splits roles into attackers (A‑element) and defenders (D‑element) around a CAP box defined by the Ruler.
+  - Prioritizes killing the enemy VIP and the most dangerous fighters while protecting own VIP.
 
-### 3. AI戦略の改善案の提案
+### 3. Phased BVR Timeline
 
-- 分析結果に基づき、既存戦略をさらに強化するための改善案を4つ提案しました。
-    1. 限定的全力攻撃モードの導入
-    2. 動的役割交代（ロールスイッチング）
-    3. 命中確率予測(PK)に基づく射撃制御
-    4. VIP護衛モードの追加
+#### Phase 0 – Pre‑merge energy build
 
-### 4. 当初戦略の実装
+- Target band: around 12,000 m and sufficient IAS; parameters tuned via `altMin`, `altMax≈14,000`, `nominalAlt≈12,000`, `minimumV≈240`, `recoveryV≈280`.
+- In `OPENING_SPREAD` the four fighters:
+  - Spread laterally (wall/early bracket) using `spreadD`, `spreadL`, `spreadAlt`.
+  - Climb with `initialClimbVz` toward the nominal altitude while maintaining speed.
+- A simple energy gate is applied in `deploy` (Phase 0):
+  - From `MotionState` we derive altitude and speed; if `alt < altEnergyMin` or `V < vEnergyMin` we treat shots as “cheap”.
+  - Cheap shots: stricter effective `rShotThreshold` / lower `pkBias`; main BVR shots are delayed until the energy band is reached.
 
-- ユーザーからの指示を受け、改善案は一旦保留としました。
-- `空戦AIの戦略とコード_SAD_v1.1.txt` に記載されているオリジナルのAIエージェントのコードを、`Agents/MyAgent` ディレクトリ配下に5つのファイル (`__init__.py`, `targeting.py`, `maneuver.py`, `evasion.py`, `utils.py`) として書き込み、実装を完了しました。
+#### Phase 1 – “Probably shot at” (pre‑seeker, d > d_Ms)
+
+- While still in `HIGH_ATTACK`, future work is to use radar/link information to detect when the enemy has likely fired at us and then:
+  - Strengthen crank components (±`crankAz`) even before MWS triggers.
+  - Maintain support for our own missiles while starting to distort the geometry.
+
+#### Phase 2 – Seeker activation region (d ≈ d_Ms)
+
+- Use range / `calcRNorm` as a proxy for the seeker activation distance:
+  - Around this band we transition from pure crank to stronger beam/early drag.
+  - Goal: start serious defensive geometry changes before the missile seeker enters its “perfect tracking” regime.
+
+#### Phase 3 – MWS‑driven terminal defence
+
+- When `/sensor/mws/track` detects any missile:
+  - Stamp `lastMwsT` per fighter and enter `DEFENSIVE_BREAK_JINK` if not already there.
+  - This state chooses between crank/beam/drag based on distance and threat LOS:
+    - Far (`d > d_far`): crank to hold support while offsetting.
+    - Mid (`d_mid < d ≤ d_far`): classic 90° beam plus gentle descent.
+    - Near (`d ≤ d_mid`): pure drag (turn tail and extend with shallow descent).
+  - A small vertical jink (up/down) is blended on top to add unpredictability.
+  - Fire is suppressed or strongly discouraged during the immediate MWS window (configurable `mwsInhibitT`).
+
+### 4. Targeting, Threat, and Data Link
+
+- Friend observables:
+  - `extractFriendObservables` aggregates all own fighters from `/shared/fighter` so the agent has a full team picture (positions, velocities, missile inventory, MWS status).
+- Enemy tracks:
+  - `extractEnemyObservables` collects radar tracks from `/sensor/track` on a representative own fighter and transforms them to the local CRS.
+  - `lastTrackInfo` is the shared enemy track list used by all four fighters.
+- Threat scoring:
+  - `compute_threat` evaluates danger to own fighter (range, closure, forward occupancy, inv‑TTI).
+  - `compute_vip_threat` approximates danger to own VIP / CAP corridor using team‑base coordinates (enemy heading into own side, distance along team axis, centrality).
+  - `compute_combined_threat` blends self and VIP components via `threat_w_self`, `threat_w_vip`.
+- Role‑based target selection:
+  - In `select_targets`, attackers (ports 0,1) pick targets by combined threat, with a bias to enemy VIP/high‑VIP‑threat tracks; defenders (ports 2,3) pick the max VIP‑threat track to protect own VIP.
+  - Simple hysteresis per fighter (`currentTruth`, `currentScore`) prevents target flapping.
+- Data‑link‑like behaviour:
+  - `/shared/fighter` and `/sensor/track` together act as a “blackboard” data link.
+  - The agent could be extended to maintain a ranked list of truths (top‑N threats) and assign them consistently to Strikers/Defenders, but basic ranking and primary selection are already implemented.
+
+### 5. Shooting Doctrine
+
+- Base gates:
+  - Shots are allowed only when:
+    - A valid enemy `Track3D` exists.
+    - The fighter has not exceeded the simultaneous missile limit (`maxSimulShot`).
+    - `shotIntervalMin` has elapsed since the last shot at that truth.
+- Energy‑aware gating (Phase 0/1):
+  - If energy band is not yet reached (`alt < altEnergyMin` or `V < vEnergyMin`), the effective `rThr` is tightened and `pkBias` is reduced so that only high‑quality shots occur.
+- BVR‑style bias:
+  - When inside a stand‑off range (`standoffShotR`) the thresholds are relaxed and `pkBias` is increased to encourage early shots with decent kinematics.
+  - VIP‑dangerous targets receive additional bias so that missiles are preferentially spent where they matter most.
+
+### 6. Formation, CAP, and Re‑commit
+
+- CAP and boundary:
+  - A `StaticCollisionAvoider2D` enforces arena boundaries (`dOut`, `dLine`) so that fighters remain inside a notional CAP box.
+  - A soft centre bias gently pulls fighters toward the arena centreline to avoid hugging the borders.
+- Re‑commit logic:
+  - `PUMP_EXTEND` state performs a cold turn away from clustered threats and extends with a slight climb until distance/time criteria are met.
+  - `RECLIMB_RECOMMIT` then brings the fighters back toward the nominal altitude and forward direction for the next attack cycle.
+
+### 7. Current Limitations and Future Work
+
+- Radar/RWR‑based “shot detection” is still approximate; more explicit missile‑launch cues from `/sensor/radar` or shared logs could allow cleaner Phase‑1 pre‑emptive crank/beam.
+- MWS fire inhibit is present but can be tuned further (exact inhibit duration and conditions).
+- Data‑link could be extended to track quality metrics (age, sensor source, RCS proxy) and to share a fully ranked threat list across the team.
