@@ -19,6 +19,22 @@ from BasicAgentUtility.util import (
     # optional for richer PK if needed in future
     # calcRHead, calcRTail,
 )
+from .targeting import (
+    compute_threat,
+    compute_vip_threat,
+    compute_combined_threat,
+    select_targets,
+    compute_pk,
+)
+from .utils import (
+    heading_for_bracket,
+    _normalize2d,
+    blend_dir,
+    compute_intercept_dir,
+    soft_center_bias_dir,
+    compute_beam_dir,
+    detect_close_threat,
+)
 
 
 class SADAgent(Agent):
@@ -271,239 +287,6 @@ class SADAgent(Agent):
             self.mws.append(mvec)
 
     # --- tactical helpers ---
-
-    def compute_threat(self, myMotion: MotionState, t: Track3D) -> float:
-        # Boundary非依存寄りの指標へ調整：距離(近いほど高)、閉塞速度(+)、前方占位(+)、invTTIは弱め
-        dr = t.pos() - myMotion.pos()
-        d2 = float(np.linalg.norm(dr[:2])) + 1e-6
-        rel_v = t.vel() - myMotion.vel()
-        closing = max(0.0, -float(np.dot(dr[:2], rel_v[:2])) / d2)
-        # 前方占位: 敵速度が自陣方向へ向いている度合い（チーム座標の-x方向を自陣内向きとみなす）
-        evel = self.teamOrigin.relPtoB(t.vel())
-        front = max(0.0, -float(evel[0]))  # >0 でこちら向き
-        # 距離スコアは 1/(d + const) で近距離優先
-        w_dist = 1.0
-        w_front = 0.8
-        w_close = self.w_closure
-        w_itti = 0.2 * self.w_invTTI  # 影響を弱める
-        dist_score = 1.0 / (d2 + 5000.0)
-        # invTTI（弱）
-        epos = self.teamOrigin.relPtoB(t.pos())
-        xdist = max(0.0, abs(float(epos[0]))) + 1e3
-        inv_tti = front / xdist
-        return w_dist * dist_score + w_front * front / 300.0 + w_close * np.tanh(closing / 200.0) + w_itti * inv_tti
-
-    def compute_vip_threat(self, t: Track3D) -> float:
-        """Approximate threat of enemy track to our VIP/cap corridor.
-        Uses team base coordinates as a proxy: enemy nose toward us (front),
-        small x-distance into our side (xdist), and central corridor preference (|y| small).
-        """
-        try:
-            epos = self.teamOrigin.relPtoB(t.pos())
-            evel = self.teamOrigin.relPtoB(t.vel())
-        except Exception:
-            return 0.0
-        xdist = max(0.0, abs(float(epos[0]))) + 1e3
-        ycorr = 1.0 / (5000.0 + abs(float(epos[1])))  # near centerline => higher
-        front = max(0.0, -float(evel[0]))
-        inv_tti = front / xdist
-        # Normalize and combine
-        return 0.7 * inv_tti + 0.3 * ycorr
-
-    def compute_combined_threat(self, myMotion: MotionState, t: Track3D) -> float:
-        s = self.compute_threat(myMotion, t)
-        v = self.compute_vip_threat(t)
-        return float(self.threat_w_self * s + self.threat_w_vip * v)
-
-    def select_targets(self):
-        # attackers: prioritize enemy VIP (via VIP-threat) when competitive, else combined threat; defenders: VIP-centric threat
-        if not self.lastTrackInfo:
-            return {}
-        targets = {}
-        sorted_ports = sorted(self.parents.keys(), key=lambda k: int(k))
-
-        # precompute global ranking once
-        comb_scores = []
-        vip_scores = []
-        my0 = None
-        for m in self.ourMotion:
-            if np.linalg.norm(m.vel()) > 1e-3:
-                my0 = m
-                break
-        if my0 is None and self.ourMotion:
-            my0 = self.ourMotion[0]
-        for idx, t in enumerate(self.lastTrackInfo):
-            try:
-                comb = self.compute_combined_threat(my0, t) if my0 is not None else 0.0
-            except Exception:
-                comb = 0.0
-            try:
-                vip = self.compute_vip_threat(t)
-            except Exception:
-                vip = 0.0
-            comb_scores.append((comb, idx, t))
-            vip_scores.append((vip, idx, t))
-        comb_scores.sort(key=lambda x: x[0], reverse=True)
-        vip_scores.sort(key=lambda x: x[0], reverse=True)
-
-        # attackers
-        attack_picks = []
-        for i, port in enumerate(sorted_ports[:2]):
-            # choose VIP if competitive vs combined best
-            pick = comb_scores[0] if comb_scores else None
-            vip_pick = vip_scores[0] if vip_scores else None
-            if vip_pick and pick and vip_pick[0] >= self.vipPickRatio * pick[0]:
-                cand = vip_pick
-            else:
-                cand = pick
-            # deconflict two attackers by taking next best combined if same index
-            if i == 1 and cand and attack_picks and cand[1] == attack_picks[0][1] and len(comb_scores) > 1:
-                cand = comb_scores[1]
-            if cand:
-                p = self.parents[port]
-                ai = self.actionInfos[p.getFullName()]
-                prev_truth = ai.currentTruth
-                prev_score = ai.currentScore
-                new_truth = getattr(cand[2], 'truth', None)
-                new_score = cand[0]
-                # hysteresis: only switch if significantly better than previous
-                if prev_truth is not None and any(getattr(t, 'truth', None) == prev_truth for _,_,t in comb_scores):
-                    if new_score <= prev_score * (1.0 + self.targetSwitchHyst):
-                        # keep previous target if still in list
-                        kept = False
-                        for s in comb_scores:
-                            if getattr(s[2], 'truth', None) == prev_truth:
-                                targets[p.getFullName()] = s[2]
-                                kept = True
-                                break
-                        if not kept:
-                            targets[p.getFullName()] = cand[2]
-                            ai.currentTruth = new_truth
-                            ai.currentScore = new_score
-                    else:
-                        targets[p.getFullName()] = cand[2]
-                        ai.currentTruth = new_truth
-                        ai.currentScore = new_score
-                else:
-                    targets[p.getFullName()] = cand[2]
-                    ai.currentTruth = new_truth
-                    ai.currentScore = new_score
-                attack_picks.append(cand)
-
-        # defenders: guard VIP by picking max VIP threat
-        for port in sorted_ports[2:4]:
-            p = self.parents[port]
-            best = vip_scores[0][2] if vip_scores else None
-            if best is not None:
-                targets[p.getFullName()] = best
-        return targets
-
-    def compute_pk(self, parent, myMotion: MotionState, tgt: Track3D) -> float:
-        # Simple surrogate of Pk using (1-RNorm), closure(+), aspect alignment
-        try:
-            r = float(calcRNorm(parent, myMotion, tgt, False))
-        except Exception:
-            dr = tgt.pos() - myMotion.pos()
-            r = min(1.0, max(0.0, np.linalg.norm(dr[:2]) / 80000.0))
-        dr = tgt.pos() - myMotion.pos()
-        rel_v = tgt.vel() - myMotion.vel()
-        closing = max(0.0, -float(np.dot(dr[:2], rel_v[:2])) / (float(np.linalg.norm(dr[:2])) + 1e-6))
-        closing_n = np.tanh(closing / 200.0)
-        los = dr / (np.linalg.norm(dr) + 1e-6)
-        aspect_align = max(0.0, float(los[0]))
-        pk = self.pk_w_r * (1.0 - r) + self.pk_w_closure * closing_n + self.pk_w_aspect * aspect_align
-        return float(max(0.0, min(1.0, pk)))
-
-    
-
-    def heading_for_bracket(self, idx, base_dir):
-        # attackers offset opposite sides for multi-axis pressure
-        side = -1.0 if (idx % 2 == 0) else 1.0
-        az = atan2(base_dir[1], base_dir[0]) + side * self.crankAz
-        return np.array([cos(az), sin(az), 0.0])
-
-    # --- new geometric helpers ---
-    def _normalize2d(self, v):
-        n = float(np.linalg.norm(v[:2]))
-        if n < 1e-6:
-            return np.array([1.0, 0.0, 0.0])
-        return np.array([v[0] / n, v[1] / n, 0.0])
-
-    def blend_dir(self, a, b, w_b):
-        w_a = 1.0 - w_b
-        v = w_a * a + w_b * b
-        n = float(np.linalg.norm(v[:2]))
-        if n < 1e-6:
-            return np.array([1.0, 0.0, 0.0])
-        return np.array([v[0] / n, v[1] / n, v[2] if abs(v[2]) > 1e-6 else 0.0])
-
-    def compute_intercept_dir(self, myMotion: MotionState, tgt: Track3D):
-        # 2Dリード迎撃: tau ~ |dr|/closing_speed を 2..8s にクリップ
-        myp = myMotion.pos(); myv = myMotion.vel()
-        tp = tgt.pos(); tv = tgt.vel()
-        dr = tp - myp
-        rel = tv - myv
-        closing = max(1.0, -float(np.dot(dr[:2], rel[:2])) / (float(np.linalg.norm(dr[:2])) + 1e-6))
-        tau = float(np.clip(float(np.linalg.norm(dr[:2])) / closing, 2.0, 8.0))
-        aim = tp + tv * tau
-        dirv = aim - myp
-        dirv[2] = 0.0
-        return self._normalize2d(dirv)
-
-    def soft_center_bias_dir(self, myMotion: MotionState, base_dir):
-        # 中央(Y=0)指向の弱いバイアスを付与（境界押し出しを抑制）
-        pB = self.teamOrigin.relPtoB(myMotion.pos())
-        biasB = np.array([0.0, -float(pB[1]), 0.0])
-        biasP = self.teamOrigin.relBtoP(biasB)
-        bias_dir = self._normalize2d(biasP)
-        return self.blend_dir(base_dir, bias_dir, 0.15)
-
-    def compute_beam_dir(self, current_dir, threat_dir):
-        # 脅威LOSに対して±90度のビーム。回頭量の小さい側を選択
-        th = self._normalize2d(threat_dir)
-        # 2D 90度回転（左/右）
-        left = np.array([-th[1], th[0], 0.0])
-        right = np.array([th[1], -th[0], 0.0])
-        cur = self._normalize2d(current_dir)
-        # コサイン距離が小さい方（=向きが近い方）を選ぶ
-        if float(np.dot(cur[:2], left[:2])) >= float(np.dot(cur[:2], right[:2])):
-            return left
-        else:
-            return right
-
-    def detect_close_threat(self, myMotion: MotionState):
-        """Return the most dangerous close threat Track3D and helper metrics.
-        Criteria:
-          - range (2D) < breakRThreat
-          - enemy nose toward us (cos >= breakEnemyNose)
-          - enemy position roughly behind our nose (cosTail <= breakCosTail)
-        """
-        if not self.lastTrackInfo:
-            return None, None, None, None
-        myp = myMotion.pos(); myv = myMotion.vel()
-        vhat = self._normalize2d(myv)
-        best = None; best_r = 1e18; best_cosTail = 1.0; best_cosNose = 0.0
-        for t in self.lastTrackInfo:
-            dr = t.pos() - myp
-            r2 = float(np.linalg.norm(dr[:2]))
-            if r2 <= 1.0:
-                continue
-            # our tail aspect: bandit position relative to our velocity
-            cosTail = float(np.dot(vhat[:2], (dr[:2] / r2)))
-            # bandit nose toward us
-            tv = t.vel(); sp = float(np.linalg.norm(tv[:2]))
-            if sp < 1.0:
-                continue
-            bnhat = tv[:2] / sp
-            toMe = (myp[:2] - t.pos()[:2])
-            toMeN = float(np.linalg.norm(toMe))
-            if toMeN < 1.0:
-                continue
-            cosNose = float(np.dot(bnhat, toMe / toMeN))
-            if r2 < self.breakRThreat and cosTail <= self.breakCosTail and cosNose >= self.breakEnemyNose:
-                if r2 < best_r:
-                    best = t; best_r = r2; best_cosTail = cosTail; best_cosNose = cosNose
-        return best, best_r, best_cosTail, best_cosNose
 
     def deploy(self, action):
         # refresh observables
@@ -975,3 +758,18 @@ class SADAgent(Agent):
     def control(self):
         # keep simple: reuse deploy decisions each tick
         self.deploy(None)
+
+
+# Attach helper functions from submodules to SADAgent for better modularity.
+SADAgent.compute_threat = compute_threat
+SADAgent.compute_vip_threat = compute_vip_threat
+SADAgent.compute_combined_threat = compute_combined_threat
+SADAgent.select_targets = select_targets
+SADAgent.compute_pk = compute_pk
+SADAgent.heading_for_bracket = heading_for_bracket
+SADAgent._normalize2d = _normalize2d
+SADAgent.blend_dir = blend_dir
+SADAgent.compute_intercept_dir = compute_intercept_dir
+SADAgent.soft_center_bias_dir = soft_center_bias_dir
+SADAgent.compute_beam_dir = compute_beam_dir
+SADAgent.detect_close_threat = detect_close_threat
