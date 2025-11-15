@@ -602,24 +602,38 @@ class SADAgent(Agent):
                     ai.dstDir = np.array([cold[0], cold[1], self.pumpVz])
 
             if ai.state == "OPENING_SPREAD":
-                # Early lateral spread and slight altitude stack to avoid bunching and set up bracket
+                # Opening phase: prioritize aggressive climb to nominal altitude band,
+                # then transition into lateral spread/formation once energy is built.
+                # Current altitude from MotionState (z is negative upward in local CRS)
+                pos = myMotion.pos()
+                alt = -float(pos[2]) if len(pos) > 2 else 0.0
                 # Compute team-forward unit and lateral normal
                 fwd = self.teamOrigin.relBtoP(np.array([1.0, 0.0, 0.0]))
                 fhat = self._normalize2d(fwd)
                 nhat = np.array([-fhat[1], fhat[0], 0.0])
-                # Build a gate point ahead + lateral by index
-                sign = -1.0 if (i % 2 == 0) else 1.0
-                gate_pt = myMotion.pos() + fhat * self.spreadD + sign * self.spreadL * nhat
-                dr = gate_pt - myMotion.pos(); dr[2] = 0.0
-                if np.linalg.norm(dr[:2]) > 1.0:
-                    base2d = dr / np.linalg.norm(dr)
-                else:
+
+                if alt < 12000.0:
+                    # Below 12km: maximum-rate climb, forward component is secondary.
+                    # Use pure forward direction with strong upward component.
                     base2d = fhat
-                # add initial climb component for altitude advantage in the opening
-                ai.dstDir = np.array([base2d[0], base2d[1], self.initialClimbVz])
-                # altitude stack
-                alt_off = (i - 1.5) * 0.5 * self.spreadAlt
-                ai.dstAlt = max(self.altMin, min(self.altMax, self.nominalAlt + alt_off))
+                    # Negative z is climb in this CRS; emphasize vertical over horizontal.
+                    vz = -abs(self.initialClimbVz)
+                    ai.dstDir = np.array([base2d[0] * 0.6, base2d[1] * 0.6, vz])
+                    ai.dstAlt = self.nominalAlt
+                else:
+                    # In band 12–14km: use existing spread/formation logic.
+                    sign = -1.0 if (i % 2 == 0) else 1.0
+                    gate_pt = myMotion.pos() + fhat * self.spreadD + sign * self.spreadL * nhat
+                    dr = gate_pt - myMotion.pos(); dr[2] = 0.0
+                    if np.linalg.norm(dr[:2]) > 1.0:
+                        base2d = dr / np.linalg.norm(dr)
+                    else:
+                        base2d = fhat
+                    # add gentle climb/level flight in spread phase
+                    ai.dstDir = np.array([base2d[0], base2d[1], 0.0])
+                    # altitude stack
+                    alt_off = (i - 1.5) * 0.5 * self.spreadAlt
+                    ai.dstAlt = max(self.altMin, min(self.altMax, self.nominalAlt + alt_off))
                 # transition when enemy close or timer expires
                 minR = 1e18
                 for t in (self.lastTrackInfo or []):
@@ -692,10 +706,25 @@ class SADAgent(Agent):
                     # base thresholds
                     rThr = self.rShotThreshold
                     pkBias = dl_bias
-                    # cheap-shot handling: if energyバンド未達成なら厳しくする
+                    # cheap-shot handling: if energy band not yet achieved, be stricter
                     if not E_ok:
                         rThr = min(1.0, rThr * 0.9)
                         pkBias -= 0.1
+                    # altitude-based range compensation: if significantly higher, extend; lower, be conservative
+                    try:
+                        my_alt = -float(myMotion.pos()[2])
+                        tgt_alt = -float(tgt.pos()[2])
+                        dalt = my_alt - tgt_alt
+                        if dalt > 1000.0:
+                            # we are higher: slightly extend range
+                            rThr = min(1.0, rThr * 1.03)
+                            pkBias += 0.03
+                        elif dalt < -1000.0:
+                            # we are lower: be a bit more conservative
+                            rThr = max(0.8, rThr * 0.97)
+                            pkBias -= 0.03
+                    except Exception:
+                        pass
                     # add VIP-threat-based bias to prioritize high-danger bandits
                     try:
                         vip_th = self.compute_vip_threat(tgt)
@@ -718,6 +747,14 @@ class SADAgent(Agent):
                         ai.launchFlag = True
                         ai.target = tgt
                         ai.lastShotTimes[tgt.truth] = now
+                        # micro nose-pointing toward target at launch for better missile kinematics
+                        try:
+                            los = tgt.pos() - myMotion.pos()
+                            los2d = self._normalize2d(los)
+                            aim_dir = np.array([los2d[0], los2d[1], 0.0])
+                            ai.dstDir = self.blend_dir(ai.dstDir, aim_dir, 0.3)
+                        except Exception:
+                            pass
                         ai.state = "PRE_PITBULL_CRANK"
                         ai.stateEnterT = now
                 ai.dstAlt = self.nominalAlt
