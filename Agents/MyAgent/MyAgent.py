@@ -50,10 +50,10 @@ class SADAgent(Agent):
         # Parameters (can be overridden by modelConfig)
         cfg = self.modelConfig if isinstance(self.modelConfig, dict) else {}
         self.altMin = float(cfg.get("altMin", 7000.0))
-        self.altMax = float(cfg.get("altMax", 14000.0))
-        self.nominalAlt = float(cfg.get("nominalAlt", 12000.0))
-        self.minimumV = float(cfg.get("minimumV", 240.0))
-        self.recoveryV = float(cfg.get("recoveryV", 280.0))
+        self.altMax = float(cfg.get("altMax", 13000.0))
+        self.nominalAlt = float(cfg.get("nominalAlt", 10000.0))
+        self.minimumV = float(cfg.get("minimumV", 200.0))
+        self.recoveryV = float(cfg.get("recoveryV", 240.0))
         self.crankAz = float(cfg.get("crankAz", np.deg2rad(35.0)))
         self.beamAz = float(cfg.get("beamAz", np.deg2rad(90.0)))
         self.pitbullDelay = float(cfg.get("pitbullDelay", 6.0))
@@ -109,14 +109,8 @@ class SADAgent(Agent):
         self.dlFocusPk = float(cfg.get("dlFocusPk", 0.35))
         self.dlPrimaryUpdateT = float(cfg.get("dlPrimaryUpdateT", 2.0))
         # Opening altitude/shot preferences
-        self.initialClimbVz = float(cfg.get("initialClimbVz", 0.30))
+        self.initialClimbVz = float(cfg.get("initialClimbVz", 0.25))
         self.standoffShotR = float(cfg.get("standoffShotR", 45000.0))
-        # Energy and phase thresholds
-        self.altEnergyMin = float(cfg.get("altEnergyMin", 10000.0))
-        self.vEnergyMin = float(cfg.get("vEnergyMin", 250.0))
-        self.dFar = float(cfg.get("dFar", 40000.0))
-        self.dMid = float(cfg.get("dMid", 20000.0))
-        self.mwsInhibitT = float(cfg.get("mwsInhibitT", 2.5))
 
         # Runtime containers
         self.ourMotion = []
@@ -543,10 +537,6 @@ class SADAgent(Agent):
             my_idx = list(self.parents.keys()).index(port)
             myMotion = self.ourMotion[my_idx]
             V = np.linalg.norm(myMotion.vel())
-            # simple energy check (Phase 0: build band)
-            pos = myMotion.pos()
-            alt = -float(pos[2]) if len(pos) > 2 else 0.0
-            E_ok = (alt >= self.altEnergyMin and V >= self.vEnergyMin)
 
             # choose target; allow datalink focus for first two (strikers)
             tgt = targets.get(pf, Track3D())
@@ -571,15 +561,12 @@ class SADAgent(Agent):
                 ai.state = "DEFENSIVE_BREAK_JINK"
                 ai.stateEnterT = now
                 ai.lastJinkFlipT = now
-            # Missile warning preemption (Phase 3): jink + fire inhibit
+            # Missile warning preemption: if any MWS tracks exist, jink immediately
             myMWS = self.mws[my_idx] if my_idx < len(self.mws) else []
-            if len(myMWS) > 0:
-                if hasattr(ai, 'lastMwsT'):
-                    ai.lastMwsT = now
-                if ai.state != "DEFENSIVE_BREAK_JINK":
-                    ai.state = "DEFENSIVE_BREAK_JINK"
-                    ai.stateEnterT = now
-                    ai.lastJinkFlipT = now
+            if len(myMWS) > 0 and ai.state != "DEFENSIVE_BREAK_JINK":
+                ai.state = "DEFENSIVE_BREAK_JINK"
+                ai.stateEnterT = now
+                ai.lastJinkFlipT = now
 
             # Outnumbered quick pump/extend: if 2+ enemies within pumpRThreat, go cold to open range
             if ai.state == "HIGH_ATTACK":
@@ -675,7 +662,7 @@ class SADAgent(Agent):
                             ai.dstDir = vel_hat
                     else:
                         ai.dstDir = np.array([cos(base_az), sin(base_az), 0.0])
-                # fire if inside normalized R threshold (with energy/phase gating)
+                # fire if inside normalized R threshold
                 if tgt and not tgt.is_none():
                     r = calcRNorm(parent, myMotion, tgt, False)
                     flying = 0
@@ -703,28 +690,9 @@ class SADAgent(Agent):
                             dl_bias = 0.05
                     except Exception:
                         pass
-                    # base thresholds
+                    # opening volley: be more permissive in first seconds
                     rThr = self.rShotThreshold
                     pkBias = dl_bias
-                    # cheap-shot handling: if energy band not yet achieved, be stricter
-                    if not E_ok:
-                        rThr = min(1.0, rThr * 0.9)
-                        pkBias -= 0.1
-                    # altitude-based range compensation: if significantly higher, extend; lower, be conservative
-                    try:
-                        my_alt = -float(myMotion.pos()[2])
-                        tgt_alt = -float(tgt.pos()[2])
-                        dalt = my_alt - tgt_alt
-                        if dalt > 1000.0:
-                            # we are higher: slightly extend range
-                            rThr = min(1.0, rThr * 1.03)
-                            pkBias += 0.03
-                        elif dalt < -1000.0:
-                            # we are lower: be a bit more conservative
-                            rThr = max(0.8, rThr * 0.97)
-                            pkBias -= 0.03
-                    except Exception:
-                        pass
                     # add VIP-threat-based bias to prioritize high-danger bandits
                     try:
                         vip_th = self.compute_vip_threat(tgt)
