@@ -62,6 +62,9 @@ class SADAgent(Agent):
         self.maxSimulShot = int(cfg.get("maxSimulShot", 2))
         self.rShotThreshold = float(cfg.get("rShotThreshold", 0.85))
         self.shotIntervalMin = float(cfg.get("shotIntervalMin", 5.0))
+        # Energy gate for BVR shots
+        self.altEnergyMin = float(cfg.get("altEnergyMin", 10000.0))
+        self.vEnergyMin = float(cfg.get("vEnergyMin", 270.0))
         # Defensive break/jink tuning
         self.breakRThreat = float(cfg.get("breakRThreat", 7000.0))
         self.breakExitR = float(cfg.get("breakExitR", 9000.0))
@@ -711,6 +714,37 @@ class SADAgent(Agent):
                     if dt <= self.openingVolleyT:
                         rThr = max(rThr, self.openRShotThreshold)
                         pkBias += self.openPkBias
+                    # Energy/altitude-aware gating:
+                    # - If below energy band, tighten range and reduce bias.
+                    # - If inside energy band, slightly relax range and increase bias.
+                    try:
+                        pos = myMotion.pos()
+                        alt = -float(pos[2]) if len(pos) > 2 else 0.0
+                    except Exception:
+                        alt = 0.0
+                    V = float(np.linalg.norm(myMotion.vel()))
+                    E_ok = (alt >= self.altEnergyMin and V >= self.vEnergyMin)
+                    if not E_ok:
+                        rThr = max(0.8, rThr * 0.97)
+                        pkBias -= 0.05
+                    else:
+                        rThr = min(1.0, rThr * 1.02)
+                        pkBias += 0.03
+                    # Altitude advantage: if we are >1km above target, allow slightly longer shots;
+                    # if we are significantly below, be more conservative.
+                    try:
+                        tpos = tgt.pos()
+                        t_alt = -float(tpos[2]) if len(tpos) > 2 else alt
+                        dalt = alt - t_alt
+                    except Exception:
+                        dalt = 0.0
+                    alt_band = 1000.0
+                    if dalt > alt_band:
+                        rThr = min(1.0, rThr * 1.03)
+                        pkBias += 0.02
+                    elif dalt < -alt_band:
+                        rThr = max(0.75, rThr * 0.97)
+                        pkBias -= 0.02
                     if r < rThr and parent.isLaunchableAt(tgt) and flying < self.maxSimulShot and ok_interval and (ok_partner or pk >= max(0.8, self.pkThreshold)) and (pk + pkBias) >= self.pkThreshold:
                         ai.launchFlag = True
                         ai.target = tgt
@@ -772,9 +806,9 @@ class SADAgent(Agent):
                     beam2d = self.compute_beam_dir(myMotion.vel(), th2d)
                     ai.dstDir = np.array([beam2d[0], beam2d[1], -abs(self.jinkVz)])
                 else:
-                    # Near: drag (turn tail and extend, slight descent)
+                    # Near: drag (turn tail and extend, slight descent with a bit more sink)
                     drag2d = -los2d
-                    ai.dstDir = np.array([drag2d[0], drag2d[1], -max(0.2, self.jinkVz)])
+                    ai.dstDir = np.array([drag2d[0], drag2d[1], -max(0.25, self.jinkVz)])
 
                 # Periodic vertical jink (modulates around chosen horizontal mode)
                 if float(now - ai.lastJinkFlipT) >= self.jinkPeriod:
