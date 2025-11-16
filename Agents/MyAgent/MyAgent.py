@@ -66,6 +66,11 @@ class SADAgent(Agent):
             self.role = "SHOOTER"
             self.cheapShotCount = 0
             self.lastCheapShotT = Time(-1e9, TimeSystem.TT)
+            # defence logging state
+            self.defenceMode = None  # None / "DEFENSIVE_BREAK_JINK" / "PUMP_EXTEND"
+            self.defenceEnterT = Time(-1e9, TimeSystem.TT)
+            self.defenceMinR = 1e18
+            self.defenceMaxClosure = 0.0
 
     def initialize(self):
         super().initialize()
@@ -241,6 +246,15 @@ class SADAgent(Agent):
                             line = (
                                 f"t={ev.get('t'):.1f} port={ev.get('fighter_port')} state={ev.get('state')} "
                                 f"INHIBIT[{ev.get('reason')}]\n"
+                            )
+                        elif ev.get("type") == "defence_enter":
+                            line = (
+                                f"t={ev.get('t'):.1f} port={ev.get('fighter_port')} DEFENCE_ENTER[{ev.get('mode')}]\n"
+                            )
+                        elif ev.get("type") == "defence_exit":
+                            line = (
+                                f"t={ev.get('t'):.1f} port={ev.get('fighter_port')} DEFENCE_EXIT[{ev.get('mode')}] "
+                                f"dur={ev.get('duration'):.1f}s minR={ev.get('min_rng'):.0f} maxCl={ev.get('max_closure'):.1f}\n"
                             )
                         else:
                             line = f"t={ev.get('t', 0)} EVENT[{ev.get('type')}]\n"
@@ -450,6 +464,8 @@ class SADAgent(Agent):
             my_idx = list(self.parents.keys()).index(port)
             myMotion = self.ourMotion[my_idx]
             V = np.linalg.norm(myMotion.vel())
+            # previous state for defence enter/exit detection
+            prev_state = ai.state
 
             # choose target; allow datalink focus for first two (strikers)
             tgt = targets.get(pf, Track3D())
@@ -1016,6 +1032,74 @@ class SADAgent(Agent):
                     ai.state = "HIGH_ATTACK"
                     ai.stateEnterT = now
                     ai.cheapShotCount = 0
+
+            # --- Defence enter/exit logging and metric accumulation ---
+            def _nearest_threat_metrics():
+                try:
+                    min_r = 1e18
+                    max_cl = 0.0
+                    myp = myMotion.pos(); myv = myMotion.vel()
+                    for t in (self.lastTrackInfo or []):
+                        dr = t.pos() - myp
+                        r2d = float(np.linalg.norm(dr[:2]))
+                        if r2d < min_r:
+                            min_r = r2d
+                        rel_v = t.vel() - myv
+                        closing = max(0.0, -float(np.dot(dr[:2], rel_v[:2])) / (r2d + 1e-6))
+                        if closing > max_cl:
+                            max_cl = closing
+                    return min_r, max_cl
+                except Exception:
+                    return 1e18, 0.0
+
+            current_mode = ai.state if ai.state in ("DEFENSIVE_BREAK_JINK", "PUMP_EXTEND") else None
+            if current_mode != ai.defenceMode:
+                # exiting previous mode
+                if ai.defenceMode is not None:
+                    try:
+                        dur = float(now - ai.defenceEnterT)
+                    except Exception:
+                        dur = 0.0
+                    try:
+                        self.logger_event({
+                            "type": "defence_exit",
+                            "t": float(now),
+                            "fighter_port": port,
+                            "side": self.getTeam(),
+                            "mode": ai.defenceMode,
+                            "enter_t": float(ai.defenceEnterT),
+                            "duration": dur,
+                            "min_rng": float(ai.defenceMinR),
+                            "max_closure": float(ai.defenceMaxClosure),
+                        })
+                    except Exception:
+                        pass
+                # entering new mode
+                if current_mode is not None:
+                    ai.defenceMode = current_mode
+                    ai.defenceEnterT = now
+                    ai.defenceMinR = 1e18
+                    ai.defenceMaxClosure = 0.0
+                    try:
+                        self.logger_event({
+                            "type": "defence_enter",
+                            "t": float(now),
+                            "fighter_port": port,
+                            "side": self.getTeam(),
+                            "mode": current_mode,
+                        })
+                    except Exception:
+                        pass
+                else:
+                    ai.defenceMode = None
+            else:
+                # accumulate metrics while inside a defence mode
+                if current_mode is not None:
+                    mr, mc = _nearest_threat_metrics()
+                    if mr < ai.defenceMinR:
+                        ai.defenceMinR = mr
+                    if mc > ai.defenceMaxClosure:
+                        ai.defenceMaxClosure = mc
 
             # Ally re-separation: if nearest ally too close, push laterally
             try:
