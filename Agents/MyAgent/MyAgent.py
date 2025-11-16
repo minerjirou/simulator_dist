@@ -175,7 +175,45 @@ class SADAgent(Agent):
         self.datalink = {
             "primary_truth": None,
             "last_update": Time(0.0, TimeSystem.TT),
+            "press": {},
+            "current_target": {},
+            "fighters": {},
+            "threat": {},
+            "vip_truth": None,
         }
+
+        # Event logger controls
+        self.loggingEnabled = bool(cfg.get("loggingEnabled", True))
+        self._log_path = None
+
+        def _ensure_log_path():
+            if not self.loggingEnabled:
+                return None
+            if self._log_path is None:
+                import os, datetime
+                base = os.path.join(os.getcwd(), "simulator_dist", "results", "MyAgent", "logs")
+                try:
+                    os.makedirs(base, exist_ok=True)
+                except Exception:
+                    pass
+                ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                self._log_path = os.path.join(base, f"fight_{ts}.log")
+            return self._log_path
+        self._ensure_log_path = _ensure_log_path
+
+        def _logger_event(ev: dict):
+            if not self.loggingEnabled:
+                return
+            try:
+                path = self._ensure_log_path()
+                if path is None:
+                    return
+                import json
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
+        self.logger_event = _logger_event
 
         # Role coordination and cheap-shot policy (configurable)
         self.roleCoordinationEnable = bool(cfg.get("roleCoordinationEnable", True))
@@ -219,6 +257,12 @@ class SADAgent(Agent):
             ai.lastCheapShotT = Time(-1e9, TimeSystem.TT)
             # Alternate roles within pairs: SHOOTER for even, COVER for odd
             ai.role = "SHOOTER" if (idx % 2 == 0) else "COVER"
+            ai.press = False
+        # reset DL shared maps
+        self.datalink["press"] = {}
+        self.datalink["current_target"] = {}
+        self.datalink["fighters"] = {}
+        self.datalink["threat"] = {}
 
     def observation_space(self):
         return self._observation_space
@@ -409,6 +453,18 @@ class SADAgent(Agent):
                     ai.stateEnterT = now
                     ai.lastJinkFlipT = now
                 inhibitFire = True
+
+            # compute and share press flag (lightweight role)
+            try:
+                alt_now = -float(myMotion.pos()[2]) if len(myMotion.pos()) > 2 else 0.0
+            except Exception:
+                alt_now = 0.0
+            E_ok_press = (alt_now >= self.altEnergyMin) and (V >= self.vEnergyMin)
+            ai.press = (len(myMWS) == 0 and close_tgt is None and E_ok_press)
+            try:
+                self.datalink["press"][port] = bool(ai.press)
+            except Exception:
+                pass
 
             # Role coordination: try to keep at least one of the pair pressing if safe
             try:
@@ -609,10 +665,16 @@ class SADAgent(Agent):
                     if dt <= self.openingVolleyT:
                         rThr = max(rThr, self.openRShotThreshold)
                         pkBias += self.openPkBias
-                    # do not fire when defensive or inhibited
+                    # compute hard_defence flag (near or close threat)
+                    hard_defence = False
+                    try:
+                        hard_defence = (rng2d <= max(20000.0, self.dMid)) or (close_tgt is not None)
+                    except Exception:
+                        pass
+                    # do not fire when defensive or inhibited (allow in soft defence)
                     ok_to_fire = True
                     if self.defensiveNoFire and (ai.state in ("DEFENSIVE_BREAK_JINK", "PUMP_EXTEND")):
-                        ok_to_fire = False
+                        ok_to_fire = (ai.state == "DEFENSIVE_BREAK_JINK") and (not hard_defence)
                     if inhibitFire:
                         ok_to_fire = False
                     # Role gating: COVER does not fire if mate is SHOOTER
@@ -693,6 +755,25 @@ class SADAgent(Agent):
                         ai.launchFlag = True
                         ai.target = tgt
                         ai.lastShotTimes[tgt.truth] = now
+                        # event log: shot
+                        try:
+                            self.logger_event({
+                                "type": "shot",
+                                "t": float(now),
+                                "fighter_port": port,
+                                "side": self.getTeam(),
+                                "state": ai.state,
+                                "target_truth": getattr(tgt, 'truth', None),
+                                "rng2d": float(rng2d),
+                                "pk": float(pk),
+                                "pkBias": float(pkBias),
+                                "E_ok": bool(E_ok),
+                                "cosHot": float(cosHot),
+                                "direct_ok": bool(direct_ok),
+                                "shot_type": "main" if (direct_ok and E_ok and cosHot >= self.hotAspectCosMin) else "cheap",
+                            })
+                        except Exception:
+                            pass
                         if 'shot_is_cheap' in locals() and shot_is_cheap:
                             try:
                                 self.actionInfos[pf].cheapShotCount += 1
@@ -709,6 +790,28 @@ class SADAgent(Agent):
                             pass
                         ai.state = "PRE_PITBULL_CRANK"
                         ai.stateEnterT = now
+                    else:
+                        # event log: inhibit (first occurrence per reason)
+                        reason = None
+                        if inhibitFire:
+                            reason = "INHIBIT_FLAG"
+                        elif ai.state in ("DEFENSIVE_BREAK_JINK", "PUMP_EXTEND"):
+                            reason = "HARD_DEFENCE" if hard_defence else "DEFENSIVE"
+                        elif not direct_ok or cosHot < self.hotAspectCosMin or not E_ok:
+                            reason = "GATE_MAIN"
+                        if reason and getattr(ai, 'lastInhibitReason', "") != reason:
+                            ai.lastInhibitReason = reason
+                            try:
+                                self.logger_event({
+                                    "type": "inhibit",
+                                    "t": float(now),
+                                    "fighter_port": port,
+                                    "side": self.getTeam(),
+                                    "reason": reason,
+                                    "state": ai.state,
+                                })
+                            except Exception:
+                                pass
                 ai.dstAlt = self.nominalAlt
 
             elif ai.state == "PUMP_EXTEND":
@@ -855,6 +958,25 @@ class SADAgent(Agent):
                     ai.state = "HIGH_ATTACK"
                     ai.stateEnterT = now
                     ai.cheapShotCount = 0
+
+            # Ally re-separation: if nearest ally too close, push laterally
+            try:
+                myp2 = myMotion.pos()[:2]
+                min_d = 1e18
+                for j, om in enumerate(self.ourMotion[: len(self.parents)]):
+                    if j == my_idx:
+                        continue
+                    op = om.pos()[:2]
+                    d = float(np.linalg.norm(op - myp2))
+                    if d < min_d:
+                        min_d = d
+                if min_d < self.allyMinSep:
+                    fwd2 = self.teamOrigin.relBtoP(np.array([1.0, 0.0, 0.0]))
+                    fhat2 = self._normalize2d(fwd2)
+                    nhat2 = np.array([-fhat2[1], fhat2[0], 0.0])
+                    ai.dstDir = self.blend_dir(ai.dstDir, nhat2, 0.3)
+            except Exception:
+                pass
 
             # 中央指向バイアスを軽く適用
             ai.dstDir = self.soft_center_bias_dir(myMotion, ai.dstDir)

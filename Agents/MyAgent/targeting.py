@@ -81,19 +81,46 @@ def select_targets(self):
     comb_scores.sort(key=lambda x: x[0], reverse=True)
     vip_scores.sort(key=lambda x: x[0], reverse=True)
 
+    # load-aware distribution using DL current_target (previous tick)
+    try:
+        prev_map = dict(self.datalink.get("current_target", {}))
+    except Exception:
+        prev_map = {}
+    load_count = {}
+    for k, v in prev_map.items():
+        if v is None:
+            continue
+        load_count[v] = load_count.get(v, 0) + 1
+
+    def under_cap(truth):
+        if truth is None:
+            return True
+        cap = getattr(self, 'maxAttackersPerTarget', 2)
+        return load_count.get(truth, 0) < cap
+
     # attackers
     attack_picks = []
     for i, port in enumerate(sorted_ports[:2]):
         # choose VIP if competitive vs combined best
         pick = comb_scores[0] if comb_scores else None
         vip_pick = vip_scores[0] if vip_scores else None
-        if vip_pick and pick and vip_pick[0] >= self.vipPickRatio * pick[0]:
-            cand = vip_pick
-        else:
-            cand = pick
+        cand = vip_pick if (vip_pick and pick and vip_pick[0] >= self.vipPickRatio * pick[0]) else pick
         # deconflict two attackers by taking next best combined if same index
         if i == 1 and cand and attack_picks and cand[1] == attack_picks[0][1] and len(comb_scores) > 1:
             cand = comb_scores[1]
+        # enforce load cap (distribution)
+        if cand:
+            truth_try = getattr(cand[2], "truth", None)
+            if not under_cap(truth_try):
+                # find first alternative not exceeding cap
+                alt = None
+                for s in comb_scores:
+                    tt = getattr(s[2], "truth", None)
+                    if tt != truth_try and under_cap(tt):
+                        alt = s
+                        break
+                if alt is not None:
+                    cand = alt
         if cand:
             p = self.parents[port]
             ai = self.actionInfos[p.getFullName()]
@@ -117,20 +144,60 @@ def select_targets(self):
                         ai.currentScore = new_score
                 else:
                     targets[p.getFullName()] = cand[2]
+                    # log switch
+                    try:
+                        is_vip = False
+                        load_new = load_count.get(new_truth, 0) + 1
+                        getattr(self, '_log_target_switch', lambda *a, **k: None)(port, prev_truth, new_truth, is_vip, load_new, "HYSTERESIS")
+                    except Exception:
+                        pass
                     ai.currentTruth = new_truth
                     ai.currentScore = new_score
             else:
                 targets[p.getFullName()] = cand[2]
+                try:
+                    is_vip = False
+                    load_new = load_count.get(new_truth, 0) + 1
+                    getattr(self, '_log_target_switch', lambda *a, **k: None)(port, prev_truth, new_truth, is_vip, load_new, "SELECT")
+                except Exception:
+                    pass
                 ai.currentTruth = new_truth
                 ai.currentScore = new_score
             attack_picks.append(cand)
+            # update load map for subsequent assignments this tick
+            if new_truth is not None:
+                load_count[new_truth] = load_count.get(new_truth, 0) + 1
 
     # defenders: guard VIP by picking max VIP threat
     for port in sorted_ports[2:4]:
         p = self.parents[port]
         best = vip_scores[0][2] if vip_scores else None
         if best is not None:
-            targets[p.getFullName()] = best
+            truth_try = getattr(best, "truth", None)
+            # enforce load cap for defenders too
+            if not under_cap(truth_try):
+                # choose next vip-threat if cap exceeded
+                alt = None
+                for s in vip_scores[1:]:
+                    tt = getattr(s[2], "truth", None)
+                    if under_cap(tt):
+                        alt = s[2]
+                        truth_try = tt
+                        break
+                targets[p.getFullName()] = alt if alt is not None else best
+            else:
+                targets[p.getFullName()] = best
+            load_count[truth_try] = load_count.get(truth_try, 0) + 1
+
+    # publish current target map to DL
+    try:
+        for port, parent in self.parents.items():
+            pf = parent.getFullName()
+            t = targets.get(pf, None)
+            truth = getattr(t, 'truth', None) if t is not None else None
+            self.datalink["current_target"][port] = truth
+    except Exception:
+        pass
     return targets
 
 
@@ -149,4 +216,3 @@ def compute_pk(self, parent, myMotion: MotionState, tgt: Track3D) -> float:
     aspect_align = max(0.0, float(los[0]))
     pk = self.pk_w_r * (1.0 - r) + self.pk_w_closure * closing_n + self.pk_w_aspect * aspect_align
     return float(max(0.0, min(1.0, pk)))
-
