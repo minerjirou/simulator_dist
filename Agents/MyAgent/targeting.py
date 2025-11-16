@@ -142,25 +142,12 @@ def select_targets(self):
                         targets[p.getFullName()] = cand[2]
                         ai.currentTruth = new_truth
                         ai.currentScore = new_score
-                else:
-                    targets[p.getFullName()] = cand[2]
-                    # log switch
-                    try:
-                        is_vip = False
-                        load_new = load_count.get(new_truth, 0) + 1
-                        getattr(self, '_log_target_switch', lambda *a, **k: None)(port, prev_truth, new_truth, is_vip, load_new, "HYSTERESIS")
-                    except Exception:
-                        pass
-                    ai.currentTruth = new_truth
-                    ai.currentScore = new_score
             else:
                 targets[p.getFullName()] = cand[2]
-                try:
-                    is_vip = False
-                    load_new = load_count.get(new_truth, 0) + 1
-                    getattr(self, '_log_target_switch', lambda *a, **k: None)(port, prev_truth, new_truth, is_vip, load_new, "SELECT")
-                except Exception:
-                    pass
+                ai.currentTruth = new_truth
+                ai.currentScore = new_score
+            else:
+                targets[p.getFullName()] = cand[2]
                 ai.currentTruth = new_truth
                 ai.currentScore = new_score
             attack_picks.append(cand)

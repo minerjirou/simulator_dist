@@ -30,8 +30,7 @@
     "initialClimbVz": 0.35,
     "altEnergyMin": 10000.0,
     "vEnergyMin": 270.0,
-    "loggingEnabled": true,
-    "textLoggingEnabled": true,
+    
     "maxAttackersPerTarget": 2,
     "allyMinSep": 8000.0,
     "dFar": 58000.0,

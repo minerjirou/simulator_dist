@@ -187,85 +187,9 @@ class SADAgent(Agent):
             "vip_truth": None,
         }
 
-        # Event logger controls
-        self.loggingEnabled = bool(cfg.get("loggingEnabled", True))
-        self.textLoggingEnabled = bool(cfg.get("textLoggingEnabled", True))
+        # logging removed in submission build
         self._log_path = None
         self._log_text_path = None
-
-        def _ensure_log_path():
-            if not self.loggingEnabled:
-                return None
-            if self._log_path is None:
-                import os, datetime
-                # Resolve repo root relative to this file to be robust to CWD
-                here = os.path.dirname(__file__)
-                repo_root = os.path.abspath(os.path.join(here, os.pardir, os.pardir))
-                base = os.path.join(repo_root, "results", "MyAgent", "log")
-                try:
-                    os.makedirs(base, exist_ok=True)
-                except Exception:
-                    pass
-                ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-                self._log_path = os.path.join(base, f"fight_{ts}.log")
-                self._log_text_path = os.path.join(base, f"fight_{ts}.txt")
-                # Write header to text log immediately
-                try:
-                    if self.textLoggingEnabled:
-                        with open(self._log_text_path, "a", encoding="utf-8") as f:
-                            f.write(f"--- New Fight {ts} team={self.getTeam()} ---\n")
-                            f.flush()
-                except Exception:
-                    pass
-            return self._log_path
-        self._ensure_log_path = _ensure_log_path
-
-        def _logger_event(ev: dict):
-            if not self.loggingEnabled:
-                return
-            try:
-                path = self._ensure_log_path()
-                if path is None:
-                    return
-                import json
-                with open(path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(ev, ensure_ascii=False) + "\n")
-                    f.flush()
-                # mirror to text log in a human-friendly line
-                if self.textLoggingEnabled:
-                    try:
-                        if self._log_text_path is None:
-                            self._ensure_log_path()
-                        if ev.get("type") == "shot":
-                            line = (
-                                f"t={ev.get('t'):.1f} port={ev.get('fighter_port')} state={ev.get('state')} "
-                                f"SHOT[{ev.get('shot_type')}] truth={ev.get('target_truth')} rng2d={ev.get('rng2d')} "
-                                f"pk={ev.get('pk'):.2f} Ek={ev.get('E_ok')} cosHot={ev.get('cosHot'):.2f}\n"
-                            )
-                        elif ev.get("type") == "inhibit":
-                            line = (
-                                f"t={ev.get('t'):.1f} port={ev.get('fighter_port')} state={ev.get('state')} "
-                                f"INHIBIT[{ev.get('reason')}]\n"
-                            )
-                        elif ev.get("type") == "defence_enter":
-                            line = (
-                                f"t={ev.get('t'):.1f} port={ev.get('fighter_port')} DEFENCE_ENTER[{ev.get('mode')}]\n"
-                            )
-                        elif ev.get("type") == "defence_exit":
-                            line = (
-                                f"t={ev.get('t'):.1f} port={ev.get('fighter_port')} DEFENCE_EXIT[{ev.get('mode')}] "
-                                f"dur={ev.get('duration'):.1f}s minR={ev.get('min_rng'):.0f} maxCl={ev.get('max_closure'):.1f}\n"
-                            )
-                        else:
-                            line = f"t={ev.get('t', 0)} EVENT[{ev.get('type')}]\n"
-                        with open(self._log_text_path, "a", encoding="utf-8") as tf:
-                            tf.write(line)
-                            tf.flush()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-        self.logger_event = _logger_event
 
         # Role coordination and cheap-shot policy (configurable)
         self.roleCoordinationEnable = bool(cfg.get("roleCoordinationEnable", True))
@@ -315,11 +239,7 @@ class SADAgent(Agent):
         self.datalink["current_target"] = {}
         self.datalink["fighters"] = {}
         self.datalink["threat"] = {}
-        # Ensure log file is created at fight start with header
-        try:
-            self._ensure_log_path()
-        except Exception:
-            pass
+        # logging removed
 
     def observation_space(self):
         return self._observation_space
@@ -814,25 +734,7 @@ class SADAgent(Agent):
                         ai.launchFlag = True
                         ai.target = tgt
                         ai.lastShotTimes[tgt.truth] = now
-                        # event log: shot
-                        try:
-                            self.logger_event({
-                                "type": "shot",
-                                "t": float(now),
-                                "fighter_port": port,
-                                "side": self.getTeam(),
-                                "state": ai.state,
-                                "target_truth": getattr(tgt, 'truth', None),
-                                "rng2d": float(rng2d),
-                                "pk": float(pk),
-                                "pkBias": float(pkBias),
-                                "E_ok": bool(E_ok),
-                                "cosHot": float(cosHot),
-                                "direct_ok": bool(direct_ok),
-                                "shot_type": "main" if (direct_ok and E_ok and cosHot >= self.hotAspectCosMin) else "cheap",
-                            })
-                        except Exception:
-                            pass
+                        # (submission) logging removed
                         if 'shot_is_cheap' in locals() and shot_is_cheap:
                             try:
                                 self.actionInfos[pf].cheapShotCount += 1
@@ -850,42 +752,9 @@ class SADAgent(Agent):
                         ai.state = "PRE_PITBULL_CRANK"
                         ai.stateEnterT = now
                     else:
-                        # event log: inhibit (first occurrence per reason)
-                        reason = None
-                        if inhibitFire:
-                            reason = "INHIBIT_FLAG"
-                        elif ai.state in ("DEFENSIVE_BREAK_JINK", "PUMP_EXTEND"):
-                            reason = "HARD_DEFENCE" if hard_defence else "DEFENSIVE"
-                        elif not direct_ok or cosHot < self.hotAspectCosMin or not E_ok:
-                            reason = "GATE_MAIN"
-                        if reason and getattr(ai, 'lastInhibitReason', "") != reason:
-                            ai.lastInhibitReason = reason
-                            try:
-                                self.logger_event({
-                                    "type": "inhibit",
-                                    "t": float(now),
-                                    "fighter_port": port,
-                                    "side": self.getTeam(),
-                                    "reason": reason,
-                                    "state": ai.state,
-                                })
-                            except Exception:
-                                pass
+                        # (submission) logging removed
                 else:
-                    # No valid target this tick; log inhibit once
-                    if getattr(ai, 'lastInhibitReason', "") != "NO_TARGET":
-                        ai.lastInhibitReason = "NO_TARGET"
-                        try:
-                            self.logger_event({
-                                "type": "inhibit",
-                                "t": float(now),
-                                "fighter_port": port,
-                                "side": self.getTeam(),
-                                "reason": "NO_TARGET",
-                                "state": ai.state,
-                            })
-                        except Exception:
-                            pass
+                    # (submission) logging removed (no target)
                 ai.dstAlt = self.nominalAlt
 
             elif ai.state == "PUMP_EXTEND":
@@ -1054,46 +923,16 @@ class SADAgent(Agent):
 
             current_mode = ai.state if ai.state in ("DEFENSIVE_BREAK_JINK", "PUMP_EXTEND") else None
             if current_mode != ai.defenceMode:
-                # exiting previous mode
-                if ai.defenceMode is not None:
-                    try:
-                        dur = float(now - ai.defenceEnterT)
-                    except Exception:
-                        dur = 0.0
-                    try:
-                        self.logger_event({
-                            "type": "defence_exit",
-                            "t": float(now),
-                            "fighter_port": port,
-                            "side": self.getTeam(),
-                            "mode": ai.defenceMode,
-                            "enter_t": float(ai.defenceEnterT),
-                            "duration": dur,
-                            "min_rng": float(ai.defenceMinR),
-                            "max_closure": float(ai.defenceMaxClosure),
-                        })
-                    except Exception:
-                        pass
-                # entering new mode
+                # exiting previous mode: logging removed
                 if current_mode is not None:
                     ai.defenceMode = current_mode
                     ai.defenceEnterT = now
                     ai.defenceMinR = 1e18
                     ai.defenceMaxClosure = 0.0
-                    try:
-                        self.logger_event({
-                            "type": "defence_enter",
-                            "t": float(now),
-                            "fighter_port": port,
-                            "side": self.getTeam(),
-                            "mode": current_mode,
-                        })
-                    except Exception:
-                        pass
                 else:
                     ai.defenceMode = None
             else:
-                # accumulate metrics while inside a defence mode
+                # accumulate metrics while inside a defence mode (keep internal only)
                 if current_mode is not None:
                     mr, mc = _nearest_threat_metrics()
                     if mr < ai.defenceMinR:
