@@ -114,6 +114,15 @@ class SADAgent(Agent):
         self.pk_w_closure = float(cfg.get("pk_w_closure", 0.3))
         self.pk_w_aspect = float(cfg.get("pk_w_aspect", 0.1))
         self.grinderT = float(cfg.get("grinderT", 12.0))
+        # Range buckets and pre-seeker geometry
+        self.dFar = float(cfg.get("dFar", 45000.0))
+        self.dMid = float(cfg.get("dMid", 25000.0))
+        self.preCrankW = float(cfg.get("preCrankW", 0.6))
+        self.earlyBeamEnable = bool(cfg.get("earlyBeamEnable", True))
+        self.mwsDirectionalMode = bool(cfg.get("mwsDirectionalMode", True))
+        # Main shot gating
+        self.mainShotRequireDirect = bool(cfg.get("mainShotRequireDirect", True))
+        self.hotAspectCosMin = float(cfg.get("hotAspectCosMin", 0.5))
         # Threat analysis weights
         self.threat_w_self = float(cfg.get("threat_w_self", 0.6))
         self.threat_w_vip = float(cfg.get("threat_w_vip", 0.4))
@@ -450,6 +459,7 @@ class SADAgent(Agent):
                     else:
                         idir = np.array([cos(base_az), sin(base_az), 0.0])
                     bdir = self.heading_for_bracket(i, idir)
+                    # base blend
                     ai.dstDir = self.blend_dir(bdir, idir, 0.4)
                 else:
                     # defenders: VIPの進行方向前方に可動ゲート（±Lの法線オフセット）
@@ -473,6 +483,32 @@ class SADAgent(Agent):
                             ai.dstDir = vel_hat
                     else:
                         ai.dstDir = np.array([cos(base_az), sin(base_az), 0.0])
+                # Pre-seeker geometry shaping (Phase1/2): early crank/beam/drag before MWS
+                if tgt and not tgt.is_none():
+                    try:
+                        dr2 = tgt.pos() - myMotion.pos()
+                        rng2d = float(np.linalg.norm(dr2[:2]))
+                    except Exception:
+                        rng2d = 1e9
+                    # strengthen crank when enemy likely nose-on and within dFar
+                    if i < 2 and rng2d <= self.dFar:
+                        try:
+                            tv = tgt.vel(); sp = float(np.linalg.norm(tv[:2]))
+                            toMe = myMotion.pos()[:2] - tgt.pos()[:2]
+                            toMeN = float(np.linalg.norm(toMe))
+                            cosNose = float(np.dot((tv[:2] / max(sp,1.0)), (toMe / max(toMeN,1.0)))) if sp >= 1.0 and toMeN >= 1.0 else 0.0
+                        except Exception:
+                            cosNose = 0.0
+                        if cosNose > 0.6:
+                            # crank bias stronger
+                            idir = self.compute_intercept_dir(myMotion, tgt)
+                            bdir = self.heading_for_bracket(i, idir)
+                            ai.dstDir = self.blend_dir(bdir, idir, self.preCrankW)
+                    # early beam near seeker distance
+                    if self.earlyBeamEnable and rng2d <= self.dMid:
+                        beam2d = self.compute_beam_dir(myMotion.vel(), dr2)
+                        ai.dstDir = np.array([beam2d[0], beam2d[1], -0.08])
+
                 # fire if inside normalized R threshold (safety-first gating applied)
                 if tgt and not tgt.is_none():
                     r = calcRNorm(parent, myMotion, tgt, False)
@@ -528,6 +564,28 @@ class SADAgent(Agent):
                         ok_to_fire = False
                     if inhibitFire:
                         ok_to_fire = False
+                    # main-shot gating using own radar lock and aspect (hot)
+                    direct_ok = True
+                    if self.mainShotRequireDirect:
+                        try:
+                            direct_ok = False
+                            if self.ourObservables[my_idx].contains_p("/sensor/track"):
+                                for tt in self.ourObservables[my_idx].at_p("/sensor/track"):
+                                    try:
+                                        if getattr(tt, 'truth', None) == getattr(tgt, 'truth', None):
+                                            direct_ok = True
+                                            break
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            direct_ok = True
+                    # aspect check (hot/quartering hot)
+                    try:
+                        vhat = self._normalize2d(myMotion.vel())
+                        los = self._normalize2d(tgt.pos() - myMotion.pos())
+                        cosHot = float(np.dot(vhat[:2], los[:2]))
+                    except Exception:
+                        cosHot = 1.0
                     # Energy/altitude-aware gating:
                     # - If below energy band, tighten range and reduce bias.
                     # - If inside energy band, slightly relax range and increase bias.
@@ -562,6 +620,10 @@ class SADAgent(Agent):
                     # conservative under disadvantage: optionally hard block
                     if self.conservativeUnderDisadvantage and (not E_ok or dalt < -alt_band or len(myMWS) > 0 or close_tgt is not None):
                         ok_to_fire = False
+                    # if not direct or not hot, treat as cheap-shot: tighten further
+                    if ok_to_fire and (not direct_ok or cosHot < self.hotAspectCosMin or not E_ok):
+                        rThr = max(0.82, rThr * 0.96)
+                        pkBias -= 0.06
                     if ok_to_fire and r < rThr and parent.isLaunchableAt(tgt) and flying < self.maxSimulShot and ok_interval and (ok_partner or pk >= max(0.8, self.pkThreshold)) and (pk + pkBias) >= self.pkThreshold:
                         ai.launchFlag = True
                         ai.target = tgt
@@ -616,6 +678,18 @@ class SADAgent(Agent):
                 farR = 40000.0
                 midR = 20000.0
 
+                # MWS directional correction: if available and configured
+                mdir = None
+                if self.mwsDirectionalMode and len(myMWS) > 0:
+                    try:
+                        mdir = np.zeros(3)
+                        for m in myMWS:
+                            d = m.dir()
+                            mdir += d
+                    except Exception:
+                        mdir = None
+                forward2d = self._normalize2d(myMotion.vel())
+
                 if dxy >= farR:
                     # Far: crank to hold support while offsetting
                     base_dir = los2d
@@ -623,8 +697,13 @@ class SADAgent(Agent):
                     ai.dstDir = self.blend_dir(base_dir, crank_dir, 0.6)
                 elif dxy >= midR:
                     # Mid: classic beam + gentle descent
-                    beam2d = self.compute_beam_dir(myMotion.vel(), th2d)
-                    ai.dstDir = np.array([beam2d[0], beam2d[1], -abs(self.jinkVz)])
+                    if mdir is not None and float(np.dot(forward2d[:2], mdir[:2])) < 0.0:
+                        # missile from rear/side -> prefer drag
+                        drag2d = -los2d
+                        ai.dstDir = np.array([drag2d[0], drag2d[1], -max(0.25, self.jinkVz)])
+                    else:
+                        beam2d = self.compute_beam_dir(myMotion.vel(), th2d)
+                        ai.dstDir = np.array([beam2d[0], beam2d[1], -abs(self.jinkVz)])
                 else:
                     # Near: drag (turn tail and extend, slight descent with a bit more sink)
                     drag2d = -los2d
