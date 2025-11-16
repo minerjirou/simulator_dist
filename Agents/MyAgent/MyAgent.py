@@ -54,6 +54,8 @@ class SADAgent(Agent):
             self.stateEnterT = Time(0.0, TimeSystem.TT)
             # jink timer for defensive break
             self.lastJinkFlipT = Time(0.0, TimeSystem.TT)
+            # last time MWS detected (for fire inhibit window)
+            self.lastMwsT = Time(-1e9, TimeSystem.TT)
             # target selection hysteresis bookkeeping
             self.currentTruth = None
             self.currentScore = -1e18
@@ -81,6 +83,12 @@ class SADAgent(Agent):
         # Energy gate for BVR shots
         self.altEnergyMin = float(cfg.get("altEnergyMin", 10000.0))
         self.vEnergyMin = float(cfg.get("vEnergyMin", 270.0))
+        # Safety-first knobs
+        self.mwsInhibitT = float(cfg.get("mwsInhibitT", 5.0))
+        self.safetyMarginV = float(cfg.get("safetyMarginV", 15.0))
+        self.pumpExitAll = bool(cfg.get("pumpExitAll", True))
+        self.defensiveNoFire = bool(cfg.get("defensiveNoFire", True))
+        self.conservativeUnderDisadvantage = bool(cfg.get("conservativeUnderDisadvantage", True))
         # Defensive break/jink tuning
         self.breakRThreat = float(cfg.get("breakRThreat", 7000.0))
         self.breakExitR = float(cfg.get("breakExitR", 9000.0))
@@ -341,18 +349,34 @@ class SADAgent(Agent):
             now = self.manager.getTime()
             dt = float(now - ai.stateEnterT)
 
-            # High-priority defensive check: close-in threat on our six with nose-on
-            close_tgt, close_r, close_cosTail, close_cosNose = self.detect_close_threat(myMotion)
-            if close_tgt is not None and ai.state != "DEFENSIVE_BREAK_JINK":
-                ai.state = "DEFENSIVE_BREAK_JINK"
-                ai.stateEnterT = now
-                ai.lastJinkFlipT = now
-            # Missile warning preemption: if any MWS tracks exist, jink immediately
+            # Safety-first: compute immediate threats and inhibit firing if necessary
             myMWS = self.mws[my_idx] if my_idx < len(self.mws) else []
-            if len(myMWS) > 0 and ai.state != "DEFENSIVE_BREAK_JINK":
-                ai.state = "DEFENSIVE_BREAK_JINK"
-                ai.stateEnterT = now
-                ai.lastJinkFlipT = now
+            inhibitFire = False
+            close_tgt, close_r, close_cosTail, close_cosNose = self.detect_close_threat(myMotion)
+            # record last MWS detection time
+            if len(myMWS) > 0:
+                ai.lastMwsT = now
+            # MWS inhibit window forces defensive
+            if (len(myMWS) > 0) or (float(now - ai.lastMwsT) <= self.mwsInhibitT):
+                if ai.state != "DEFENSIVE_BREAK_JINK":
+                    ai.state = "DEFENSIVE_BREAK_JINK"
+                    ai.stateEnterT = now
+                    ai.lastJinkFlipT = now
+                inhibitFire = True
+            # Close six threat forces defensive
+            elif close_tgt is not None:
+                if ai.state != "DEFENSIVE_BREAK_JINK":
+                    ai.state = "DEFENSIVE_BREAK_JINK"
+                    ai.stateEnterT = now
+                    ai.lastJinkFlipT = now
+                inhibitFire = True
+            # Low speed energy floor: prefer defensive/extend to regain energy
+            elif V < (self.minimumV + self.safetyMarginV):
+                if ai.state != "DEFENSIVE_BREAK_JINK":
+                    ai.state = "DEFENSIVE_BREAK_JINK"
+                    ai.stateEnterT = now
+                    ai.lastJinkFlipT = now
+                inhibitFire = True
 
             # Outnumbered quick pump/extend: if 2+ enemies within pumpRThreat, go cold to open range
             if ai.state == "HIGH_ATTACK":
@@ -373,6 +397,7 @@ class SADAgent(Agent):
                     else:
                         cold = np.array([cos(base_az + np.pi), sin(base_az + np.pi), 0.0])
                     ai.dstDir = np.array([cold[0], cold[1], self.pumpVz])
+                    inhibitFire = True
 
             if ai.state == "OPENING_SPREAD":
                 # Opening phase: prioritize aggressive climb to nominal altitude band,
@@ -448,7 +473,7 @@ class SADAgent(Agent):
                             ai.dstDir = vel_hat
                     else:
                         ai.dstDir = np.array([cos(base_az), sin(base_az), 0.0])
-                # fire if inside normalized R threshold
+                # fire if inside normalized R threshold (safety-first gating applied)
                 if tgt and not tgt.is_none():
                     r = calcRNorm(parent, myMotion, tgt, False)
                     flying = 0
@@ -497,6 +522,12 @@ class SADAgent(Agent):
                     if dt <= self.openingVolleyT:
                         rThr = max(rThr, self.openRShotThreshold)
                         pkBias += self.openPkBias
+                    # do not fire when defensive or inhibited
+                    ok_to_fire = True
+                    if self.defensiveNoFire and (ai.state in ("DEFENSIVE_BREAK_JINK", "PUMP_EXTEND")):
+                        ok_to_fire = False
+                    if inhibitFire:
+                        ok_to_fire = False
                     # Energy/altitude-aware gating:
                     # - If below energy band, tighten range and reduce bias.
                     # - If inside energy band, slightly relax range and increase bias.
@@ -528,7 +559,10 @@ class SADAgent(Agent):
                     elif dalt < -alt_band:
                         rThr = max(0.75, rThr * 0.97)
                         pkBias -= 0.02
-                    if r < rThr and parent.isLaunchableAt(tgt) and flying < self.maxSimulShot and ok_interval and (ok_partner or pk >= max(0.8, self.pkThreshold)) and (pk + pkBias) >= self.pkThreshold:
+                    # conservative under disadvantage: optionally hard block
+                    if self.conservativeUnderDisadvantage and (not E_ok or dalt < -alt_band or len(myMWS) > 0 or close_tgt is not None):
+                        ok_to_fire = False
+                    if ok_to_fire and r < rThr and parent.isLaunchableAt(tgt) and flying < self.maxSimulShot and ok_interval and (ok_partner or pk >= max(0.8, self.pkThreshold)) and (pk + pkBias) >= self.pkThreshold:
                         ai.launchFlag = True
                         ai.target = tgt
                         ai.lastShotTimes[tgt.truth] = now
@@ -558,8 +592,11 @@ class SADAgent(Agent):
                     cold = np.array([cos(base_az + np.pi), sin(base_az + np.pi), 0.0])
                 ai.dstDir = np.array([cold[0], cold[1], self.pumpVz])
                 ai.dstAlt = min(self.altMax, self.nominalAlt + 800.0)
-                # Exit if distance opened or time elapsed
-                if (minR >= self.pumpExitR) or (dt >= self.pumpTime):
+                # Exit if distance/time criteria satisfied (AND if configured)
+                cond_dist = (minR >= self.pumpExitR)
+                cond_time = (dt >= self.pumpTime)
+                exit_ok = (cond_dist and cond_time) if self.pumpExitAll else (cond_dist or cond_time)
+                if exit_ok:
                     ai.state = "RECLIMB_RECOMMIT"
                     ai.stateEnterT = now
 
@@ -660,7 +697,11 @@ class SADAgent(Agent):
                 # climb back and point nose in for recommit
                 ai.dstDir = np.array([cos(base_az), sin(base_az), 0.2])
                 ai.dstAlt = min(self.altMax, self.nominalAlt + 500.0)
-                if dt >= self.recommitTime:
+                # Only recommit if time elapsed AND energy/picture are acceptable
+                E_ok = (np.linalg.norm(myMotion.vel()) >= self.vEnergyMin) and ((-float(myMotion.pos()[2])) >= self.altEnergyMin)
+                mws_ok = (float(now - ai.lastMwsT) > self.mwsInhibitT)
+                no_close = (self.detect_close_threat(myMotion)[0] is None)
+                if dt >= self.recommitTime and E_ok and mws_ok and no_close:
                     ai.state = "HIGH_ATTACK"
                     ai.stateEnterT = now
 
