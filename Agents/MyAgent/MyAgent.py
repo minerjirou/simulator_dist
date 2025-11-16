@@ -59,9 +59,13 @@ class SADAgent(Agent):
             # target selection hysteresis bookkeeping
             self.currentTruth = None
             self.currentScore = -1e18
-            # target hysteresis
+            # duplicate kept for compatibility
             self.currentTruth = None
             self.currentScore = -1e18
+            # role coordination (Shooter/Cover) and cheap-shot policy
+            self.role = "SHOOTER"
+            self.cheapShotCount = 0
+            self.lastCheapShotT = Time(-1e9, TimeSystem.TT)
 
     def initialize(self):
         super().initialize()
@@ -173,6 +177,11 @@ class SADAgent(Agent):
             "last_update": Time(0.0, TimeSystem.TT),
         }
 
+        # Role coordination and cheap-shot policy (configurable)
+        self.roleCoordinationEnable = bool(cfg.get("roleCoordinationEnable", True))
+        self.cheapShotMaxPerEngage = int(cfg.get("cheapShotMaxPerEngage", 1))
+        self.cheapShotExtraInterval = float(cfg.get("cheapShotExtraInterval", 3.0))
+
         # Minimal gym spaces to satisfy GymManager
         self._observation_space = spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32)
         self._action_space = spaces.Discrete(1)
@@ -187,15 +196,29 @@ class SADAgent(Agent):
         self.dLine = dLine
 
         # Setup controller mode and initial heading (toward forward along team axis)
-        for _, parent in self.parents.items():
+        # Establish simple pairing: (0,1) and (2,3) by port index
+        self._pairMate = {}
+        port_list = sorted(self.parents.keys(), key=lambda k: int(k))
+        if len(port_list) >= 2:
+            self._pairMate[port_list[0]] = port_list[1]
+            self._pairMate[port_list[1]] = port_list[0]
+        if len(port_list) >= 4:
+            self._pairMate[port_list[2]] = port_list[3]
+            self._pairMate[port_list[3]] = port_list[2]
+        for idx, port in enumerate(port_list):
+            parent = self.parents[port]
             parent.setFlightControllerMode("fromDirAndVel")
             ai = self.actionInfos[parent.getFullName()]
-            # Initial heading: forward along team axis
+            # Initial heading and state
             ai.dstDir = np.array([0.0, -1.0 if self.getTeam() == eastSider else 1.0, 0.0])
             ai.dstAlt = self.nominalAlt
             ai.state = "OPENING_SPREAD"
             ai.stateEnterT = self.manager.getTime()
             ai.lastShotTimes = {}
+            ai.cheapShotCount = 0
+            ai.lastCheapShotT = Time(-1e9, TimeSystem.TT)
+            # Alternate roles within pairs: SHOOTER for even, COVER for odd
+            ai.role = "SHOOTER" if (idx % 2 == 0) else "COVER"
 
     def observation_space(self):
         return self._observation_space
@@ -387,6 +410,33 @@ class SADAgent(Agent):
                     ai.lastJinkFlipT = now
                 inhibitFire = True
 
+            # Role coordination: try to keep at least one of the pair pressing if safe
+            try:
+                if getattr(self, 'roleCoordinationEnable', True) and 'mate_port' in locals():
+                    # If I'm defensive/pump -> COVER
+                    if ai.state in ("DEFENSIVE_BREAK_JINK", "PUMP_EXTEND"):
+                        ai.role = "COVER"
+                    # Evaluate mate threat
+                    mate_is_threat = False
+                    if mate_port in self.parents:
+                        m_idx = list(self.parents.keys()).index(mate_port)
+                        m_mws = self.mws[m_idx] if m_idx < len(self.mws) else []
+                        m_motion = self.ourMotion[m_idx]
+                        if len(m_mws) > 0 or self.detect_close_threat(m_motion)[0] is not None:
+                            mate_is_threat = True
+                    i_safe = (len(myMWS) == 0 and close_tgt is None and ai.state not in ("DEFENSIVE_BREAK_JINK", "PUMP_EXTEND") and V >= self.vEnergyMin)
+                    if mate_is_threat and i_safe:
+                        ai.role = "SHOOTER"
+                    # If both safe and both COVER, lower port becomes SHOOTER
+                    if ai.role == "COVER" and mate_ai is not None and getattr(mate_ai, 'role', 'SHOOTER') == "COVER" and i_safe:
+                        try:
+                            if int(port) < int(mate_port):
+                                ai.role = "SHOOTER"
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
             # Outnumbered quick pump/extend: if 2+ enemies within pumpRThreat, go cold to open range
             if ai.state == "HIGH_ATTACK":
                 nearCnt = 0
@@ -450,6 +500,7 @@ class SADAgent(Agent):
                 if dt >= self.openingSpreadT or minR <= self.engageDetectR:
                     ai.state = "HIGH_ATTACK"
                     ai.stateEnterT = now
+                    ai.cheapShotCount = 0
 
             elif ai.state == "HIGH_ATTACK":
                 # attackers: 予測迎撃ベクトルを基準に±crankのブラケット
@@ -564,6 +615,12 @@ class SADAgent(Agent):
                         ok_to_fire = False
                     if inhibitFire:
                         ok_to_fire = False
+                    # Role gating: COVER does not fire if mate is SHOOTER
+                    try:
+                        if getattr(self, 'roleCoordinationEnable', True) and ai.role == "COVER" and mate_ai is not None and getattr(mate_ai, 'role', 'SHOOTER') == "SHOOTER":
+                            ok_to_fire = False
+                    except Exception:
+                        pass
                     # main-shot gating using own radar lock and aspect (hot)
                     direct_ok = True
                     if self.mainShotRequireDirect:
@@ -620,14 +677,28 @@ class SADAgent(Agent):
                     # conservative under disadvantage: optionally hard block
                     if self.conservativeUnderDisadvantage and (not E_ok or dalt < -alt_band or len(myMWS) > 0 or close_tgt is not None):
                         ok_to_fire = False
-                    # if not direct or not hot, treat as cheap-shot: tighten further
-                    if ok_to_fire and (not direct_ok or cosHot < self.hotAspectCosMin or not E_ok):
+                    # if not direct or not hot/energy, treat as cheap-shot: tighten further and budget per engagement
+                    shot_is_cheap = (not direct_ok) or (cosHot < self.hotAspectCosMin) or (not E_ok)
+                    if ok_to_fire and shot_is_cheap:
                         rThr = max(0.82, rThr * 0.96)
                         pkBias -= 0.06
+                        try:
+                            if self.actionInfos[pf].cheapShotCount >= getattr(self, 'cheapShotMaxPerEngage', 1):
+                                ok_to_fire = False
+                            if ok_to_fire and float(now - self.actionInfos[pf].lastCheapShotT) < (self.shotIntervalMin + getattr(self, 'cheapShotExtraInterval', 3.0)):
+                                ok_to_fire = False
+                        except Exception:
+                            pass
                     if ok_to_fire and r < rThr and parent.isLaunchableAt(tgt) and flying < self.maxSimulShot and ok_interval and (ok_partner or pk >= max(0.8, self.pkThreshold)) and (pk + pkBias) >= self.pkThreshold:
                         ai.launchFlag = True
                         ai.target = tgt
                         ai.lastShotTimes[tgt.truth] = now
+                        if 'shot_is_cheap' in locals() and shot_is_cheap:
+                            try:
+                                self.actionInfos[pf].cheapShotCount += 1
+                                self.actionInfos[pf].lastCheapShotT = now
+                            except Exception:
+                                pass
                         # micro nose-pointing toward target at launch for better missile kinematics
                         try:
                             los = tgt.pos() - myMotion.pos()
@@ -783,6 +854,7 @@ class SADAgent(Agent):
                 if dt >= self.recommitTime and E_ok and mws_ok and no_close:
                     ai.state = "HIGH_ATTACK"
                     ai.stateEnterT = now
+                    ai.cheapShotCount = 0
 
             # 中央指向バイアスを軽く適用
             ai.dstDir = self.soft_center_bias_dir(myMotion, ai.dstDir)
